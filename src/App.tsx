@@ -71,6 +71,8 @@ import AdminDashboard from "./pages/AdminDashboard";
 import Profile from "./pages/Profile";
 import UpdatePassword from "./pages/UpdatePassword";
 import NotFound from "./pages/NotFound";
+import ResetPassword from "./pages/ResetPassword";
+<Route path="/reset-password" element={<ResetPassword />} />
 
 
 const queryClient = new QueryClient();

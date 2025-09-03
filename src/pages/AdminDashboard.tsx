@@ -431,6 +431,9 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
+// ✅ NEW: use supabase directly to read pending mentor profiles
+import { supabase } from "@/lib/supabase";
+
 const AdminDashboard = () => {
   const navigate = useNavigate();
   const user = getCurrentUser();
@@ -438,11 +441,14 @@ const AdminDashboard = () => {
   const [mentors, setMentors] = useState<Mentor[]>([]);
   const [bookings, setBookings] = useState<Booking[]>([]);
 
+  // ✅ NEW: pending mentor PROFILES (role='mentor' AND verified=false)
+  const [pendingProfiles, setPendingProfiles] = useState<any[]>([]);
+
   // Eye dialog state
   const [viewOpen, setViewOpen] = useState(false);
   const [viewMentor, setViewMentor] = useState<Mentor | null>(null);
 
-  // Add-mentor dialog state
+  // Add-mentor dialog state (kept same)
   const [addOpen, setAddOpen] = useState(false);
   const [addName, setAddName] = useState("");
   const [addTitle, setAddTitle] = useState("");
@@ -465,6 +471,17 @@ const AdminDashboard = () => {
         setStats(s);
         setMentors(ms);
         setBookings(bs);
+
+        // ✅ fetch pending mentor PROFILES (admins can read via policy we added)
+        const { data: pend, error: pendErr } = await supabase
+          .from("profiles")
+          .select("id, user_id, name, email, avatar, title, company, experience, rating, bio, specialties, verified, role")
+          .eq("role", "mentor")
+          .eq("verified", false)
+          .order("created_at", { ascending: false });
+
+        if (pendErr) throw pendErr;
+        setPendingProfiles(pend ?? []);
       } catch (e: any) {
         toast({
           title: "Failed to load admin data",
@@ -475,7 +492,7 @@ const AdminDashboard = () => {
     })();
   }, [user, navigate]);
 
-  // Derived lists
+  // Derived lists (approved still comes from mentors list which shows verified/public)
   const pendingMentors = useMemo(
     () =>
       mentors.filter(
@@ -489,18 +506,29 @@ const AdminDashboard = () => {
       mentors.filter(
         (m: any) =>
           (m as any).status === "approved" ||
-          (m as any).status === "active" || // treat seed "active" as approved/active
+          (m as any).status === "active" ||
           (m as any).verified === true
       ),
     [mentors]
   );
 
+  // ✅ refresh now also re-fetches pending PROFILES
   const refresh = async () => {
     try {
       const [ms, s, bs] = await Promise.all([listMentors(), getAdminStats(), listBookings()]);
       setMentors(ms);
       setStats(s);
       setBookings(bs);
+
+      const { data: pend, error: pendErr } = await supabase
+        .from("profiles")
+        .select("id, user_id, name, email, avatar, title, company, experience, rating, bio, specialties, verified, role")
+        .eq("role", "mentor")
+        .eq("verified", false)
+        .order("created_at", { ascending: false });
+
+      if (pendErr) throw pendErr;
+      setPendingProfiles(pend ?? []);
     } catch (e: any) {
       toast({
         title: "Refresh failed",
@@ -510,6 +538,7 @@ const AdminDashboard = () => {
     }
   };
 
+  // Existing mentor approve (by mentorId) – used only where mentors list is shown as approved
   const handleApproveMentor = async (mentorId: string) => {
     try {
       await approveMentor(mentorId);
@@ -536,7 +565,31 @@ const AdminDashboard = () => {
     setViewOpen(true);
   };
 
-  // ADD NEW MENTOR (creates a pending mentor locally and updates state so it appears)
+  // ✅ NEW: Approve/Reject by PROFILE (pending list is profiles)
+  const handleApproveProfile = async (profileId: string) => {
+    try {
+      // flip verified=true via secure RPC
+      const { error } = await supabase.rpc("admin_set_verified", { _profile_id: profileId, _verified: true });
+      if (error) throw error;
+      await refresh();
+      toast({ title: "Mentor Approved", description: "Profile verified successfully." });
+    } catch (e: any) {
+      toast({ title: "Approve failed", description: e?.message ?? "Please try again.", variant: "destructive" });
+    }
+  };
+
+  const handleRejectProfile = async (profileId: string) => {
+    try {
+      const { error } = await supabase.rpc("admin_set_verified", { _profile_id: profileId, _verified: false });
+      if (error) throw error;
+      await refresh();
+      toast({ title: "Mentor Rejected", description: "Profile set to not verified." });
+    } catch (e: any) {
+      toast({ title: "Reject failed", description: e?.message ?? "Please try again.", variant: "destructive" });
+    }
+  };
+
+  // ADD NEW MENTOR (kept same – local pending seed)
   const handleAddSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const id = "m_" + Math.random().toString(36).slice(2, 10);
@@ -569,12 +622,11 @@ const AdminDashboard = () => {
       weeklySchedule: [] as any,
       bufferMinutes: 15 as any,
       timeOff: [] as any,
-      status: "pending" as any, // <-- critical so it shows in Pending tab
+      status: "pending" as any,
       payoutConnected: false as any,
     };
 
     upsertMentorProfile(newMentor);
-    // also update local state so it appears immediately
     setMentors((prev) => [newMentor, ...prev]);
 
     setAddOpen(false);
@@ -589,7 +641,6 @@ const AdminDashboard = () => {
 
   if (!user || user.role !== "admin") return null;
 
-  // Booking status classes
   const statusClasses: Record<string, string> = {
     confirmed: "bg-green-100 text-green-800",
     completed: "bg-green-100 text-green-800",
@@ -722,7 +773,7 @@ const AdminDashboard = () => {
                 <TabsTrigger value="approved">Approved Mentors</TabsTrigger>
               </TabsList>
 
-              {/* PENDING */}
+              {/* PENDING (now renders from profiles) */}
               <TabsContent value="pending">
                 <Card>
                   <CardHeader>
@@ -740,29 +791,29 @@ const AdminDashboard = () => {
                         </TableRow>
                       </TableHeader>
                       <TableBody>
-                        {pendingMentors.length === 0 && (
+                        {pendingProfiles.length === 0 && (
                           <TableRow>
                             <TableCell colSpan={5} className="text-sm text-muted-foreground">
                               No pending applications.
                             </TableCell>
                           </TableRow>
                         )}
-                        {pendingMentors.map((mentor: any) => (
-                          <TableRow key={mentor.id}>
+                        {pendingProfiles.map((p: any) => (
+                          <TableRow key={p.id}>
                             <TableCell className="flex items-center gap-3">
                               <Avatar>
-                                <AvatarImage src={mentor.avatar} />
-                                <AvatarFallback>{mentor.name.charAt(0)}</AvatarFallback>
+                                <AvatarImage src={p.avatar} />
+                                <AvatarFallback>{(p.name || "M").charAt(0)}</AvatarFallback>
                               </Avatar>
                               <div>
-                                <div className="font-medium">{mentor.name}</div>
-                                <div className="text-sm text-muted-foreground">{mentor.title}</div>
+                                <div className="font-medium">{p.name}</div>
+                                <div className="text-sm text-muted-foreground">{p.title}</div>
                               </div>
                             </TableCell>
-                            <TableCell>{mentor.experience} years</TableCell>
+                            <TableCell>{p.experience ?? 0} years</TableCell>
                             <TableCell>
                               <div className="flex flex-wrap gap-1">
-                                {(mentor.specialties || []).slice(0, 2).map((specialty: string) => (
+                                {(Array.isArray(p.specialties) ? p.specialties : []).slice(0, 2).map((specialty: string) => (
                                   <Badge key={specialty} variant="secondary" className="text-xs">
                                     {specialty}
                                   </Badge>
@@ -776,17 +827,46 @@ const AdminDashboard = () => {
                             </TableCell>
                             <TableCell>
                               <div className="flex gap-2">
-                                <Button size="sm" variant="outline" onClick={() => handleViewMentor(mentor.id)}>
+                                {/* For pending, view just shows profile basics */}
+                                <Button size="sm" variant="outline" onClick={() => {
+                                  setViewMentor({
+                                    // map minimal profile fields to Mentor-like view
+                                    id: p.id,
+                                    name: p.name,
+                                    title: p.title,
+                                    company: p.company,
+                                    avatar: p.avatar,
+                                    verified: false,
+                                    experience: p.experience ?? 0,
+                                    price: p.price ?? 0,
+                                    rating: p.rating ?? 0,
+                                    reviews: 0,
+                                    specialties: Array.isArray(p.specialties) ? p.specialties : [],
+                                    availability: "medium" as any,
+                                    timezone: p.timezone ?? "UTC",
+                                    bio: p.bio ?? "",
+                                    headline: p.title ? `${p.title}${p.company ? ` @ ${p.company}` : ""}` : "",
+                                    languages: [],
+                                    yearsOfExperience: p.experience ?? 0,
+                                    packages: [],
+                                    weeklySchedule: [],
+                                    bufferMinutes: 15 as any,
+                                    timeOff: [],
+                                    status: "pending" as any,
+                                    payoutConnected: false as any,
+                                  } as any);
+                                  setViewOpen(true);
+                                }}>
                                   <Eye className="h-4 w-4" />
                                 </Button>
                                 <Button
                                   size="sm"
-                                  onClick={() => handleApproveMentor(mentor.id)}
+                                  onClick={() => handleApproveProfile(p.id)}
                                   className="bg-green-600 hover:bg-green-700"
                                 >
                                   <Check className="h-4 w-4" />
                                 </Button>
-                                <Button size="sm" variant="destructive" onClick={() => handleRejectMentor(mentor.id)}>
+                                <Button size="sm" variant="destructive" onClick={() => handleRejectProfile(p.id)}>
                                   <X className="h-4 w-4" />
                                 </Button>
                               </div>
@@ -799,7 +879,7 @@ const AdminDashboard = () => {
                 </Card>
               </TabsContent>
 
-              {/* APPROVED */}
+              {/* APPROVED (unchanged: uses mentors list) */}
               <TabsContent value="approved">
                 <Card>
                   <CardHeader>
@@ -956,7 +1036,7 @@ const AdminDashboard = () => {
             <DialogTitle>Mentor Details</DialogTitle>
           </DialogHeader>
 
-        {viewMentor && (
+          {viewMentor && (
             <div className="space-y-3">
               <div className="flex items-center gap-3">
                 <div className="h-12 w-12 rounded-full overflow-hidden bg-gray-200">
@@ -1005,7 +1085,7 @@ const AdminDashboard = () => {
         </DialogContent>
       </Dialog>
 
-      {/* Add New Mentor Dialog */}
+      {/* Add New Mentor Dialog (unchanged) */}
       <Dialog open={addOpen} onOpenChange={setAddOpen}>
         <DialogContent>
           <DialogHeader>

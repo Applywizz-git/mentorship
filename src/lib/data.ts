@@ -1044,56 +1044,141 @@ export async function registerUser(args: {
   const role = args.role;
   const password = args.password;
 
-  // Supabase sign-up
+  // 1) Sign up and include role/mobile in metadata
   const { data: signUpData, error: signUpErr } = await supabase.auth.signUp({
     email,
     password,
     options: { data: { mobile, role } },
   });
   if (signUpErr) throw signUpErr;
-  const user = signUpData.user;
-  if (!user) throw new Error("Sign up failed");
 
-  // Ensure profile (idempotent)
-  const { error: upsertErr } = await supabase
+  // 2) Ensure we have a session (important when email confirmations are enabled)
+  if (!signUpData.session) {
+    const { data: s2, error: e2 } = await supabase.auth.signInWithPassword({ email, password });
+    if (e2) throw e2;
+  }
+
+  // 3) Get the authed user id
+  const { data: uinfo } = await supabase.auth.getUser();
+  const uid = uinfo?.user?.id;
+  if (!uid) throw new Error("No session after sign up");
+
+  // 4) Upsert profile with the chosen role (idempotent)
+  const { data: profUp, error: profErr } = await supabase
     .from("profiles")
     .upsert(
-      { user_id: user.id, name: email.split("@")[0], email, role, verified: role === "client" },
+      { user_id: uid, name: email.split("@")[0], email, role, verified: role === "client" },
       { onConflict: "user_id" }
-    );
-  if (upsertErr) throw upsertErr;
+    )
+    .select("id")
+    .single();
+  if (profErr) throw profErr;
+  const profileId = profUp?.id;
 
-  // Keep local cache for your existing UI
-  cacheCurrentUser({ id: user.id, role, name: email.split("@")[0], email });
+  // 5) If role=mentor, ensure a mentors row exists for this user (idempotent)
+  if (role === "mentor" && profileId) {
+    const { error: mErr } = await supabase
+      .from("mentors")
+      .upsert(
+        { user_id: uid, profile_id: profileId, availability: "high", reviews: 0 },
+        { onConflict: "user_id" }
+      );
+    if (mErr) throw mErr;
+  }
 
-  // Keep legacy demo-auth list for compatibility (won't be used by Supabase)
+  // 6) Update our local cache for your existing UI
+  cacheCurrentUser({ id: uid, role, name: email.split("@")[0], email });
+
+  // 7) Keep legacy demo-auth list for compatibility (optional)
   const exists = getAuthUsers().some(u => u.email.toLowerCase() === email.toLowerCase());
   if (!exists) {
-    const authRec: AuthUser = { id: user.id, email, mobile, role, password };
+    const authRec: AuthUser = { id: uid, email, mobile, role, password };
     const auths = getAuthUsers(); auths.push(authRec); saveAuthUsers(auths);
   }
-  return { id: user.id, role, name: email.split("@")[0], email } as User;
+
+  return { id: uid, role, name: email.split("@")[0], email } as User;
 }
 
 export async function authenticateUser(email: string, password: string): Promise<User | null> {
+  // 1) Sign in
   const { data, error } = await supabase.auth.signInWithPassword({ email, password });
   if (error) return null;
 
-  // Pull profile to know role/name/avatar
-  const { data: prof } = await supabase
+  // 2) Ensure a session & get uid
+  const { data: uinfo } = await supabase.auth.getUser();
+  const uid = uinfo?.user?.id;
+  if (!uid) return null;
+
+  // 3) Ensure a profile exists (idempotent)
+  const { data: existing } = await supabase
     .from("profiles")
-    .select("user_id, name, email, role, avatar")
-    .eq("user_id", data.user?.id ?? "")
+    .select("id, role, name, email, avatar")
+    .eq("user_id", uid)
     .maybeSingle();
 
-  const name = prof?.name ?? (email.split("@")[0]);
-  const role = (prof?.role as RoleLite) ?? "client";
-  const avatar = prof?.avatar ?? "";
+  if (!existing) {
+    const roleFromMeta = (uinfo.user?.user_metadata?.role as "client" | "mentor" | "admin") ?? "client";
+    const nameFromEmail = (uinfo.user?.email ?? "").split("@")[0];
 
-  const current: User = { id: data.user!.id, role, name, email, avatar };
+    const { data: prof, error: upErr } = await supabase
+      .from("profiles")
+      .upsert(
+        {
+          user_id: uid,
+          name: nameFromEmail,
+          email: uinfo.user?.email ?? "",
+          role: roleFromMeta,
+          // new accounts visible only after admin approval
+          verified: roleFromMeta === "client",
+        },
+        { onConflict: "user_id" }
+      )
+      .select("id, role, name, email, avatar")
+      .single();
+    if (upErr) throw upErr;
+
+    // If mentor, ensure a mentors row exists (idempotent)
+    if (prof?.id && roleFromMeta === "mentor") {
+      const { error: mErr } = await supabase
+        .from("mentors")
+        .upsert(
+          { user_id: uid, profile_id: prof.id, availability: "high", reviews: 0 },
+          { onConflict: "user_id" }
+        );
+      if (mErr) throw mErr;
+    }
+  }
+
+  // ✅ NEW: if this user is a mentor, resolve & cache their mentorId for the dashboard
+  try {
+    const { data: m } = await supabase
+      .from("mentors")
+      .select("id")
+      .eq("user_id", uid)
+      .maybeSingle();
+    if (m?.id) {
+      setCurrentMentorId(m.id); // caches to localStorage for Upcoming, etc.
+    }
+  } catch {
+    // non-fatal; continue
+  }
+
+  // 4) Pull profile (now guaranteed to exist) to determine role/name/avatar
+  const { data: prof2 } = await supabase
+    .from("profiles")
+    .select("user_id, name, email, role, avatar")
+    .eq("user_id", uid)
+    .maybeSingle();
+
+  const name = prof2?.name ?? (email.split("@")[0]);
+  const role = (prof2?.role as "client" | "mentor" | "admin") ?? "client";
+  const avatar = prof2?.avatar ?? "";
+
+  const current: User = { id: uid, role, name, email, avatar };
   cacheCurrentUser(current);
   return current;
 }
+
 
 export function isAuthenticated(): boolean {
   // Kept sync for your existing components; reflects our cached session
@@ -1220,6 +1305,54 @@ export async function getMentor(id: string): Promise<Mentor | null> {
   };
   return m;
 }
+export async function getMyMentorId(): Promise<string | null> {
+  const { data: uinfo } = await supabase.auth.getUser();
+  const uid = uinfo?.user?.id;
+  if (!uid) return null;
+
+  const { data, error } = await supabase
+    .from("mentors")
+    .select("id")
+    .eq("user_id", uid)
+    .maybeSingle();
+
+  if (error) return null;
+
+  const mid = data?.id ?? null;
+  if (mid) write(KEY.currentMentorId, mid); // cache for dashboard
+  return mid;
+}
+export async function listUpcomingForMentor(mentorId: string) {
+  const nowIso = new Date().toISOString();
+
+  const { data, error } = await supabase
+    .from("bookings")
+    .select(`
+      id, mentor_id, client_id, slot_id, status, created_at, updated_at,
+      time_slots!inner ( start_iso, end_iso )
+    `) // 👈 removed price, currency
+    .eq("mentor_id", mentorId)
+    .gt("time_slots.start_iso", nowIso)
+    .order("start_iso", { ascending: true, foreignTable: "time_slots" });
+
+  if (error) throw error;
+
+  return (data ?? []).map((b: any) => ({
+    id: b.id,
+    mentorId: b.mentor_id,
+    clientId: b.client_id,
+    slotId: b.slot_id,
+    status: b.status ?? "confirmed",
+    createdAt: b.created_at,
+    updatedAt: b.updated_at,
+    startIso: b.time_slots?.start_iso ?? "",
+    endIso: b.time_slots?.end_iso ?? "",
+    // keep safe defaults; these fields don't exist in DB
+    price: 0,
+    currency: "USD",
+  }));
+}
+
 
 // Leave these as local-only for now (you can DB-ify later if you want full profile editing UI)
 export function upsertMentorProfile(mentor: Mentor) {
@@ -1262,13 +1395,13 @@ export async function listSlotsForMentor(mentorId: string): Promise<TimeSlot[]> 
 export async function listBookings(opts?: { mentorId?: string; clientId?: string; status?: BookingStatus }) {
   // Join to time_slots to get start/end
   let q = supabase
-    .from("bookings")
-    .select(`
-      id, mentor_id, client_id, slot_id, status, created_at, updated_at, price, currency,
-      time_slots:slot_id ( start_iso, end_iso )
-    `)
-    .order("created_at", { ascending: false });
-
+  .from("bookings")
+  .select(`
+    id, mentor_id, client_id, slot_id, status, created_at, updated_at,
+    time_slots:slot_id ( start_iso, end_iso )
+  `) // 👈 removed price, currency
+  .order("created_at", { ascending: false });
+  
   if (opts?.mentorId) q = q.eq("mentor_id", opts.mentorId);
   if (opts?.clientId) q = q.eq("client_id", opts.clientId);
   if (opts?.status)   q = q.eq("status", opts.status);
@@ -1618,6 +1751,46 @@ export async function markMentorPending(mentorId: string) {
   if (error) throw error;
   return true;
 }
+// Create slots for specific dates (selected on a calendar)
+export async function createSlotsForDates(
+  mentorId: string,
+  dates: Date[],
+  startHHMM: string,   // e.g. "09:00"
+  endHHMM: string,     // e.g. "12:00"
+  durationMin: number  // e.g. 30
+) {
+  if (!dates?.length) return { inserted: 0 };
+  const [sH, sM] = startHHMM.split(":").map(Number);
+  const [eH, eM] = endHHMM.split(":").map(Number);
+
+  function toUTCISO(d: Date, h: number, m: number) {
+    const dt = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate(), h, m, 0));
+    return dt.toISOString();
+  }
+
+  const rows: any[] = [];
+  for (const d of dates) {
+    // build slots within the window for this day
+    let cursor = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate(), sH, sM, 0));
+    const end = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate(), eH, eM, 0));
+    while (new Date(cursor.getTime() + durationMin * 60_000) <= end) {
+      const slotEnd = new Date(cursor.getTime() + durationMin * 60_000);
+      rows.push({
+        mentor_id: mentorId,
+        start_iso: cursor.toISOString(),
+        end_iso: slotEnd.toISOString(),
+        available: true,
+      });
+      cursor = slotEnd; // no buffer here; add buffer after if you want
+    }
+  }
+
+  if (!rows.length) return { inserted: 0 };
+  const { error } = await supabase.from("time_slots").insert(rows);
+  if (error) throw error;
+  return { inserted: rows.length };
+}
+
 
 /* =========================================================
    8) Compatibility helpers (unchanged local utilities)

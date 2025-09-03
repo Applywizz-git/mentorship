@@ -474,10 +474,13 @@ import {
   listBookings,
   listSlotsForMentor,
   rescheduleBooking,
-  updateMentorProfile
+  updateMentorProfile,
+  getMyMentorId,                 // (already imported)
+  listUpcomingForMentor          // (already imported)
 } from "@/lib/data";
 import type { Booking, TimeSlot, Mentor, SessionPackage, WeeklySlot } from "@/lib/types";
 import { useToast } from "@/hooks/use-toast";
+import AvailabilityCalendar from "@/components/AvailabilityCalendar";
 
 const MentorDashboard = () => {
   const [mentor, setMentor] = useState<Mentor | null>(null);
@@ -507,11 +510,37 @@ const MentorDashboard = () => {
   const [pending, setPending] = useState(0);
   const [tx, setTx] = useState<{id:string; date:string; client:string; amount:number; status:"pending"|"paid"}[]>([]);
 
+  // ✅ NEW: DB-backed upcoming rows
+  const [upcoming, setUpcoming] = useState<any[]>([]);
+
+  // ✅ Load upcoming (DB) and cache a valid mentorId if needed
+  useEffect(() => {
+    (async () => {
+      let mentorId = getCurrentMentorId?.() || "";
+      if (!mentorId || mentorId === "fallback") {
+        mentorId = (await getMyMentorId()) || "";
+      }
+      if (!mentorId) return;
+
+      try {
+        const rows = await listUpcomingForMentor(mentorId);
+        setUpcoming(rows);
+        // console.log("[Upcoming] mentorId:", mentorId, "rows:", rows);
+      } catch (e) {
+        console.error("Upcoming load failed", e);
+      }
+    })();
+  }, []);
+
   const { toast } = useToast();
 
   useEffect(() => {
     (async () => {
-      const currentMentorId = getCurrentMentorId();
+      // ✅ ensure we have a real mentor id even if cache was empty
+      let currentMentorId = getCurrentMentorId();
+      if (!currentMentorId || currentMentorId === "fallback") {
+        currentMentorId = (await getMyMentorId()) || "";
+      }
       if (!currentMentorId) return;
 
       const mentorData = await getMentor(currentMentorId);
@@ -662,10 +691,12 @@ const MentorDashboard = () => {
     toast({ title: "Availability updated", description: "Your weekly schedule was saved." });
   };
 
-  const upcomingBookings = bookings.filter(b => {
+  // ✅ Prefer DB-backed upcoming; if empty, fall back to legacy local computation
+  const legacyUpcoming = bookings.filter(b => {
     const slot = getBookingSlot(b.slotId);
     return slot && new Date(slot.startIso) > new Date();
   });
+  const upcomingBookings = (upcoming && upcoming.length > 0) ? upcoming : legacyUpcoming;
 
   if (!mentor) {
     return (
@@ -748,6 +779,7 @@ const MentorDashboard = () => {
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
                     <Calendar className="w-5 h-5" />
+                    {/* ✅ counts DB-backed list when available */}
                     Upcoming Sessions ({upcomingBookings.length})
                   </CardTitle>
                 </CardHeader>
@@ -759,11 +791,15 @@ const MentorDashboard = () => {
                     </div>
                   ) : (
                     <div className="space-y-4">
-                      {upcomingBookings.map((booking) => {
-                        const slot = getBookingSlot(booking.slotId);
-                        if (!slot) return null;
+                      {upcomingBookings.map((booking: any) => {
+                        // ✅ Prefer startIso from DB-backed 'upcoming'; else fall back to local slot lookup
+                        const startIso: string =
+                          booking.startIso ||
+                          getBookingSlot(booking.slotId)?.startIso ||
+                          "";
 
-                        const { date, time } = formatDateTime(slot.startIso);
+                        if (!startIso) return null;
+                        const { date, time } = formatDateTime(startIso);
 
                         return (
                           <div key={booking.id} className="flex items-center justify-between p-4 border border-border rounded-lg">
@@ -1000,51 +1036,13 @@ const MentorDashboard = () => {
               </Card>
             </TabsContent>
 
-            <TabsContent value="availability">
-              <Card>
-                <CardHeader>
-                  <CardTitle>Availability Management</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-6">
-                  <div className="grid md:grid-cols-3 gap-4">
-                    <div>
-                      <Label>Buffer (minutes)</Label>
-                      <Input
-                        type="number"
-                        min={0}
-                        value={bufferEdit}
-                        onChange={e => setBufferEdit(parseInt(e.target.value || "0"))}
-                      />
-                    </div>
-                  </div>
-
-                  <div className="grid gap-4">
-                    {weeklyEdit.map((slot) => (
-                      <div key={slot.id} className="grid md:grid-cols-4 gap-3 items-center">
-                        <div className="font-medium">
-                          {["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][slot.weekday]}
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <Badge variant="secondary">{slot.active ? "Enabled" : "Disabled"}</Badge>
-                        </div>
-                        <div className="grid grid-cols-2 gap-2">
-                          <Input type="time" value={slot.start} onChange={e => setTimeForDay(slot.weekday, "start", e.target.value)} />
-                          <Input type="time" value={slot.end}   onChange={e => setTimeForDay(slot.weekday, "end", e.target.value)} />
-                        </div>
-                        <div className="text-right">
-                          <Button variant="outline" size="sm" onClick={() => toggleDay(slot.weekday, !slot.active)}>
-                            {slot.active ? "Disable" : "Enable"}
-                          </Button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-
-                  <div className="flex justify-end">
-                    <Button onClick={saveAvailability}>Save Availability</Button>
-                  </div>
-                </CardContent>
-              </Card>
+            <TabsContent value="availability" className="p-4">
+              <h2 className="text-xl font-semibold mb-4">Availability Management</h2>
+              {getCurrentMentorId() ? (
+                <AvailabilityCalendar mentorId={getCurrentMentorId()} />
+              ) : (
+                <p className="text-sm text-muted-foreground">Loading mentor profile…</p>
+              )}
             </TabsContent>
 
             <TabsContent value="pricing">
