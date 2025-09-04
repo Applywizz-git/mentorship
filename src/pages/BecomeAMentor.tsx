@@ -299,8 +299,12 @@
 
 // export default BecomeAMentor;
 
-import { useState, useMemo } from "react";
+// src/pages/BecomeAMentor.tsx
+// src/pages/BecomeAMentor.tsx// src/pages/BecomeAMentor.tsx
+// src/pages/BecomeAMentor.tsx
+import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -308,167 +312,281 @@ import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { Navbar } from "@/components/ui/navbar";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "@/hooks/use-toast";
-import { 
-  getCurrentUser, getCurrentMentorId, updateMentorProfile, getMentor, 
-  upsertMentorProfile 
-} from "@/lib/data";
-import { Mentor, WeeklySlot, SessionPackage, TimeOff } from "@/lib/types";
 import logo from "@/assets/applywizz-logo.png";
 
-type Step = 1 | 2 | 3 | 4 | 5;
+import { supabase } from "@/lib/supabase";
 
-const CATEGORIES = ["Software", "Product", "Data Science", "AI/ML", "Career Coaching", "Design", "Marketing"];
-const LANGS = ["English", "Hindi", "Telugu", "Tamil", "Kannada", "Spanish", "French"];
-const CURRENCIES = ["USD", "INR", "EUR", "GBP"] as const;
+// Supabase-backed helpers (from src/lib/data.ts)
+import {
+  saveBasicInfo,          // { profileId, email?, phone?, name? }
+  uploadResume,           // (file, userId) -> returns storage key
+  upsertMentorApplication // { userId, profileId, resumePath, specialties?, experience? }
+} from "@/lib/data";
 
-const defaultPkg = (id:string, label:string, minutes:number, price:number, currency:any): SessionPackage => ({
-  id, label, minutes, price, currency, active: true
-});
+type Step = 1 | 2 | 3;
 
-const defaultWeekly: WeeklySlot[] = [
-  { id: crypto.randomUUID(), weekday: 1, start: "18:00", end: "21:00", active: true },
-  { id: crypto.randomUUID(), weekday: 3, start: "18:00", end: "21:00", active: true },
+const CATEGORIES = [
+  "Software",
+  "Product",
+  "Data Science",
+  "AI/ML",
+  "Career Coaching",
+  "Design",
+  "Marketing",
 ];
+
+const LANGS = ["English", "Hindi", "Telugu", "Tamil", "Kannada", "Spanish", "French"];
 
 export default function BecomeAMentor() {
   const navigate = useNavigate();
-  const user = getCurrentUser();
-  const mentorId = getCurrentMentorId();
-  const existing: Mentor | null = getMentor(mentorId);
 
+  // Auth/profile
+  const [loadingUser, setLoadingUser] = useState(true);
+  const [userId, setUserId] = useState<string>("");
+  const [profileId, setProfileId] = useState<string>("");
+
+  // Wizard
   const [step, setStep] = useState<Step>(1);
-  const totalSteps = 5;
+  const totalSteps = 3;
   const progress = useMemo(() => (step / totalSteps) * 100, [step]);
 
-  const [basic, setBasic] = useState({
-    name: existing?.name || user.name || "",
-    headline: existing?.headline || "",
-    bio: existing?.bio || "",
-    photo: existing?.avatar || "",
-    videoUrl: existing?.videoUrl || ""
-  });
+  // STEP 1 — Basic Info
+  const [name, setName] = useState<string>("");
+  const [email, setEmail] = useState<string>("");
+  const [mobile, setMobile] = useState<string>("");
+  const [bio, setBio] = useState<string>("");
+  const [photo, setPhoto] = useState<string>("");
 
-  const [expertise, setExpertise] = useState({
-    categories: existing?.specialties || [],
-    years: existing?.yearsOfExperience?.toString() || (existing?.experience?.toString() ?? "1"),
-    languages: existing?.languages || []
-  });
+  const emailValid = /^\S+@\S+\.\S+$/.test((email || "").trim());
+  const mobileValid = !!(mobile && mobile.replace(/[^\d]/g, "").length >= 10);
 
-  const [pricing, setPricing] = useState({
-    currency: (existing?.packages?.[0]?.currency ?? "USD") as typeof CURRENCIES[number],
-    packages: existing?.packages?.length ? existing.packages : [
-      defaultPkg("pkg30", "30 min", 30, 30, "USD"),
-      defaultPkg("pkg45", "45 min", 45, 45, "USD"),
-      defaultPkg("pkg60", "60 min", 60, 60, "USD"),
-    ] as SessionPackage[]
-  });
+  // STEP 2 — Resume (PDF)
+  const [resumeFile, setResumeFile] = useState<File | null>(null);
+  const [resumePath, setResumePath] = useState<string | null>(null);
+  const resumeOk = useMemo(() => {
+    if (!resumeFile) return false;
+    const isPdf =
+      resumeFile.type === "application/pdf" ||
+      resumeFile.name.toLowerCase().endsWith(".pdf");
+    const sizeOk = resumeFile.size <= 10 * 1024 * 1024; // 10 MB
+    return isPdf && sizeOk;
+  }, [resumeFile]);
 
-  const [availability, setAvailability] = useState({
-    weekly: existing?.weeklySchedule?.length ? existing.weeklySchedule : defaultWeekly,
-    bufferMinutes: existing?.bufferMinutes ?? 15,
-    timeOff: (existing?.timeOff ?? []) as TimeOff[]
-  });
+  // STEP 3 — Expertise (pricing removed)
+  const [categories, setCategories] = useState<string[]>([]);
+  const [years, setYears] = useState<number | "">("");
+  const [languages, setLanguages] = useState<string[]>([]); // optional UI only
 
-  const [payout, setPayout] = useState({
-    provider: existing?.payoutProvider ?? "stripe",
-    connected: existing?.payoutConnected ?? false,
-    accountId: existing?.payoutAccountId ?? ""
-  });
+  const [submitting, setSubmitting] = useState(false);
 
-  // keep your existing Step type: type Step = 1 | 2 | 3 | 4 | 5;
+  // ------- helper: ensure a profiles row exists (avoids mentors.profile_id FK errors)
+  async function ensureProfileExists(
+    pid: string,
+    uid: string,
+    base: { name: string; email: string; phone: string }
+  ) {
+    const { data: existing, error: selErr } = await supabase
+      .from("profiles")
+      .select("id")
+      .eq("id", pid)
+      .maybeSingle();
+    if (selErr) throw selErr;
 
-const handleNext = () =>
-  setStep(prev => (prev < 5 ? ((prev + 1) as Step) : prev));
+    if (!existing) {
+      const { error: insErr } = await supabase.from("profiles").insert({
+        id: pid,
+        user_id: uid,
+        name: base.name || null,
+        email: base.email || null,
+        phone: base.phone || null,
+        role: "mentor",
+      });
+      if (insErr) throw insErr;
+    }
+  }
+  // -------
 
-const handleBack = () =>
-  setStep(prev => (prev > 1 ? ((prev - 1) as Step) : prev));
+  // Load current user + profile (and prefill fields)
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data: auth } = await supabase.auth.getUser();
+        const authUser = auth?.user;
+        if (!authUser?.id) {
+          setLoadingUser(false);
+          toast({
+            title: "Please sign in",
+            description: "You need to log in to apply as a mentor.",
+            variant: "destructive",
+          });
+          return;
+        }
+
+        const uid = authUser.id;
+        setUserId(uid);
+
+        // profiles.id commonly equals auth uid; fetch to prefill
+        const { data: prof, error: profErr } = await supabase
+          .from("profiles")
+          .select("id, name, email, phone, bio, avatar, specialties, experience")
+          .eq("id", uid)
+          .maybeSingle();
+        if (profErr) throw profErr;
+
+        const pid = prof?.id ?? uid;
+        setProfileId(pid);
+
+        // Prefill step 1 + 3
+        setName(prof?.name ?? "");
+        setEmail(prof?.email ?? authUser.email ?? "");
+        setMobile(prof?.phone ?? "");
+        setBio((prof as any)?.bio ?? "");
+        setPhoto((prof as any)?.avatar ?? "");
+        setCategories(Array.isArray(prof?.specialties) ? (prof?.specialties as string[]) : []);
+        setYears(typeof prof?.experience === "number" ? prof?.experience : "");
+      } catch (e: any) {
+        toast({
+          title: "Error loading profile",
+          description: e?.message ?? String(e),
+          variant: "destructive",
+        });
+      } finally {
+        setLoadingUser(false);
+      }
+    })();
+  }, []);
 
   const toggleCategory = (cat: string) => {
-    setExpertise(prev => {
-      const selected = new Set(prev.categories);
-      if (selected.has(cat)) selected.delete(cat); else selected.add(cat);
-      return { ...prev, categories: Array.from(selected) };
-    });
+    setCategories((prev) =>
+      prev.includes(cat) ? prev.filter((c) => c !== cat) : [...prev, cat]
+    );
   };
+
   const toggleLanguage = (lng: string) => {
-    setExpertise(prev => {
-      const selected = new Set(prev.languages);
-      if (selected.has(lng)) selected.delete(lng); else selected.add(lng);
-      return { ...prev, languages: Array.from(selected) };
-    });
+    setLanguages((prev) =>
+      prev.includes(lng) ? prev.filter((l) => l !== lng) : [...prev, lng]
+    );
   };
 
-  const updatePkg = (id: string, patch: Partial<SessionPackage>) => {
-    setPricing(prev => ({
-      ...prev,
-      packages: prev.packages.map(p => p.id === id ? { ...p, ...patch } : p)
-    }));
+  const next = async () => {
+    try {
+      if (!userId || !profileId) {
+        toast({
+          title: "Not signed in",
+          description: "Please log in first.",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      if (step === 1) {
+        if (!name.trim()) {
+          toast({ title: "Name required", variant: "destructive" });
+          return;
+        }
+        if (!emailValid) {
+          toast({
+            title: "Invalid email",
+            description: "Please enter a valid email.",
+            variant: "destructive",
+          });
+          return;
+        }
+        if (!mobileValid) {
+          toast({
+            title: "Invalid mobile",
+            description: "Enter at least 10 digits.",
+            variant: "destructive",
+          });
+          return;
+        }
+
+        // ✅ Ensure a profile row exists BEFORE any mentors write (avoids FK error)
+        await ensureProfileExists(profileId, userId, {
+          name: name.trim(),
+          email: email.trim(),
+          phone: mobile.trim(),
+        });
+
+        // Persist basic info (your existing helper)
+        await saveBasicInfo({
+          profileId,
+          email: email.trim(),
+          phone: mobile.trim(),
+          name: name.trim(),
+        });
+
+        // Optional: persist bio/avatar if your schema has these columns
+        try {
+          const { error: upErr } = await supabase
+            .from("profiles")
+            .update({ bio: bio || null, avatar: photo || null })
+            .eq("id", profileId);
+          if (upErr) {
+            // ignore silently if your schema doesn't have these columns
+          }
+        } catch {
+          // ignore
+        }
+
+        setStep(2);
+        toast({ title: "Saved", description: "Basic info updated." });
+      } else if (step === 2) {
+        if (!resumeFile || !resumeOk) {
+          toast({
+            title: "Resume required",
+            description: "Upload a PDF (≤10MB).",
+            variant: "destructive",
+          });
+          return;
+        }
+        const key = await uploadResume(resumeFile, userId);
+        setResumePath(key);
+        setStep(3);
+        toast({ title: "Resume uploaded", description: "Proceed to expertise." });
+      } else if (step === 3) {
+        setSubmitting(true);
+
+        const safeYears = Math.max(0, Number(years || 0));
+
+        await upsertMentorApplication({
+          userId,
+          profileId,
+          resumePath,               // keep this name; your helper expects it
+          specialties: categories,  // stored to profiles.specialties
+          experience: safeYears,    // stored to profiles.experience
+        });
+
+        setSubmitting(false);
+        toast({
+          title: "Application submitted",
+          description: "Your application is now pending admin approval.",
+        });
+        navigate("/mentor"); // adjust if your mentor dashboard route differs
+      }
+    } catch (e: any) {
+      setSubmitting(false);
+      toast({
+        title: "Error",
+        description: e?.message ?? String(e),
+        variant: "destructive",
+      });
+    }
   };
 
-  const addWeeklyRow = () => {
-    setAvailability(prev => ({
-      ...prev,
-      weekly: [...prev.weekly, { id: crypto.randomUUID(), weekday: 1, start: "18:00", end: "21:00", active: true }]
-    }));
-  };
-  const updateWeekly = (id: string, patch: Partial<WeeklySlot>) => {
-    setAvailability(prev => ({
-      ...prev,
-      weekly: prev.weekly.map(w => w.id === id ? { ...w, ...patch } : w)
-    }));
-  };
-  const removeWeekly = (id: string) => {
-    setAvailability(prev => ({ ...prev, weekly: prev.weekly.filter(w => w.id !== id) }));
-  };
+  const back = () => setStep((s) => (s > 1 ? ((s - 1) as Step) : s));
 
-  const saveAll = () => {
-    const mentor: Mentor = {
-      ...(existing ?? {
-        id: mentorId,
-        name: basic.name || user.name || "New Mentor",
-        title: existing?.title ?? "",
-        company: existing?.company ?? "",
-        avatar: basic.photo || existing?.avatar || "",
-        verified: true,
-        experience: Number(expertise.years) || 1,
-        price: 0,
-        rating: existing?.rating ?? 0,
-        reviews: existing?.reviews ?? 0,
-        specialties: [],
-        availability: "medium",
-        timezone: user.timezone || "IST",
-      }),
-      name: basic.name || user.name,
-      headline: basic.headline,
-      bio: basic.bio,
-      avatar: basic.photo || existing?.avatar || "",
-      videoUrl: basic.videoUrl || undefined,
-      specialties: expertise.categories,
-      yearsOfExperience: Number(expertise.years) || 1,
-      languages: expertise.languages,
-      packages: pricing.packages.map(p => ({ ...p, currency: pricing.currency })),
-      weeklySchedule: availability.weekly,
-      bufferMinutes: availability.bufferMinutes,
-      timeOff: availability.timeOff,
-      payoutProvider: payout.provider as any,
-      payoutConnected: payout.connected,
-      payoutAccountId: payout.accountId,
-      status: "pending_approval"
-    };
-
-    const saved = upsertMentorProfile(mentor);
-    updateMentorProfile(saved.id, {}); // regenerate slots
-
-    toast({
-      title: "Onboarding Complete",
-      description: "Your profile is submitted for review. You'll be activated soon."
-    });
-    navigate("/mentor");
-  };
+  if (loadingUser) {
+    return (
+      <>
+        <Navbar />
+        <div className="max-w-5xl mx-auto px-6 py-16">
+          <p className="text-muted-foreground">Loading…</p>
+        </div>
+      </>
+    );
+  }
 
   return (
     <>
@@ -485,50 +603,129 @@ const handleBack = () =>
           <CardHeader>
             <CardTitle>
               {step === 1 && "Step 1: Basic Info"}
-              {step === 2 && "Step 2: Expertise"}
-              {step === 3 && "Step 3: Pricing"}
-              {step === 4 && "Step 4: Availability"}
-              {step === 5 && "Step 5: Payout Setup"}
+              {step === 2 && "Step 2: Resume"}
+              {step === 3 && "Step 3: Expertise"}
             </CardTitle>
           </CardHeader>
+
           <CardContent className="space-y-6">
+            {/* STEP 1 */}
             {step === 1 && (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div className="space-y-4">
                   <div>
                     <Label>Name</Label>
-                    <Input value={basic.name} onChange={e => setBasic({ ...basic, name: e.target.value })} />
+                    <Input
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                      placeholder="Your full name"
+                    />
                   </div>
                   <div>
-                    <Label>Headline</Label>
-                    <Input placeholder="Senior Data Scientist at Google" value={basic.headline} onChange={e => setBasic({ ...basic, headline: e.target.value })} />
+                    <Label>Email</Label>
+                    <Input
+                      type="email"
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      placeholder="you@example.com"
+                    />
+                    {!emailValid && email.length > 0 && (
+                      <p className="text-xs text-red-500 mt-1">Enter a valid email.</p>
+                    )}
                   </div>
                   <div>
-                    <Label>Bio</Label>
-                    <Textarea rows={6} maxLength={500} placeholder="Tell clients about your background (max 500 chars)" value={basic.bio} onChange={e => setBasic({ ...basic, bio: e.target.value })} />
-                    <p className="text-xs text-muted-foreground text-right">{basic.bio.length}/500</p>
+                    <Label>Mobile number</Label>
+                    <Input
+                      value={mobile}
+                      onChange={(e) => setMobile(e.target.value)}
+                      placeholder="+91 9xxxx xxxxx"
+                    />
+                    {!mobileValid && mobile.length > 0 && (
+                      <p className="text-xs text-red-500 mt-1">Enter at least 10 digits.</p>
+                    )}
                   </div>
                 </div>
+
                 <div className="space-y-4">
                   <div>
-                    <Label>Profile Photo URL</Label>
-                    <Input placeholder="https://..." value={basic.photo} onChange={e => setBasic({ ...basic, photo: e.target.value })} />
+                    <Label>Short Bio</Label>
+                    <Textarea
+                      rows={6}
+                      maxLength={500}
+                      placeholder="Tell clients about your background (max 500 chars)"
+                      value={bio}
+                      onChange={(e) => setBio(e.target.value)}
+                    />
+                    <p className="text-xs text-muted-foreground text-right">
+                      {bio.length}/500
+                    </p>
                   </div>
                   <div>
-                    <Label>Intro Video URL (optional)</Label>
-                    <Input placeholder="YouTube/Vimeo link" value={basic.videoUrl} onChange={e => setBasic({ ...basic, videoUrl: e.target.value })} />
+                    <Label>Profile Photo URL</Label>
+                    <Input
+                      placeholder="https://..."
+                      value={photo}
+                      onChange={(e) => setPhoto(e.target.value)}
+                    />
                   </div>
+                </div>
+
+                <div className="flex justify-end md:col-span-2">
+                  <Button onClick={next} disabled={!emailValid || !mobileValid || !name.trim()}>
+                    Save & Continue
+                  </Button>
                 </div>
               </div>
             )}
 
+            {/* STEP 2 */}
             {step === 2 && (
+              <div className="grid gap-4">
+                <div>
+                  <Label>Resume (PDF, ≤10MB)</Label>
+                  <Input
+                    type="file"
+                    accept=".pdf,application/pdf"
+                    onChange={(e) => setResumeFile(e.target.files?.[0] ?? null)}
+                  />
+                  {resumeFile && (
+                    <p className="text-xs mt-1">
+                      Selected: {resumeFile.name} ({Math.round(resumeFile.size / 1024)} KB)
+                    </p>
+                  )}
+                  {!resumeOk && resumeFile && (
+                    <p className="text-xs text-red-500 mt-1">
+                      Please upload a valid PDF file under 10MB.
+                    </p>
+                  )}
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Private upload. Admin can view via a signed link.
+                  </p>
+                </div>
+                <div className="flex justify-between">
+                  <Button variant="ghost" onClick={back}>
+                    Back
+                  </Button>
+                  <Button onClick={next} disabled={!resumeFile || !resumeOk}>
+                    Upload & Continue
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {/* STEP 3 */}
+            {step === 3 && (
               <div className="space-y-6">
                 <div>
-                  <Label>Categories</Label>
+                  <Label>Expertise / Specialties</Label>
                   <div className="flex flex-wrap gap-2 mt-2">
-                    {CATEGORIES.map(c => (
-                      <Button key={c} variant={expertise.categories.includes(c) ? "default" : "outline"} size="sm" onClick={() => toggleCategory(c)}>
+                    {CATEGORIES.map((c) => (
+                      <Button
+                        key={c}
+                        variant={categories.includes(c) ? "default" : "outline"}
+                        size="sm"
+                        onClick={() => toggleCategory(c)}
+                      >
                         {c}
                       </Button>
                     ))}
@@ -537,153 +734,45 @@ const handleBack = () =>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                   <div>
-                    <Label>Years of experience</Label>
-                    <Input type="number" min={0} value={expertise.years} onChange={e => setExpertise({ ...expertise, years: e.target.value })} />
+                    <Label>Years of Experience</Label>
+                    <Input
+                      type="number"
+                      min={0}
+                      value={years}
+                      onChange={(e) =>
+                        setYears(e.target.value === "" ? "" : Number(e.target.value))
+                      }
+                    />
                   </div>
                   <div>
-                    <Label>Languages</Label>
+                    <Label>Languages (optional)</Label>
                     <div className="flex flex-wrap gap-2 mt-2">
-                      {LANGS.map(l => (
-                        <Button key={l} variant={expertise.languages.includes(l) ? "default" : "outline"} size="sm" onClick={() => toggleLanguage(l)}>
+                      {LANGS.map((l) => (
+                        <Button
+                          key={l}
+                          variant={languages.includes(l) ? "default" : "outline"}
+                          size="sm"
+                          onClick={() => toggleLanguage(l)}
+                        >
                           {l}
                         </Button>
                       ))}
                     </div>
                   </div>
                 </div>
-              </div>
-            )}
 
-            {step === 3 && (
-              <div className="space-y-6">
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                  <div>
-                    <Label>Currency</Label>
-                    <Select value={pricing.currency} onValueChange={(v) => setPricing(prev => ({ ...prev, currency: v as any }))}>
-                      <SelectTrigger><SelectValue placeholder="Select currency" /></SelectTrigger>
-                      <SelectContent>
-                        {CURRENCIES.map(c => <SelectItem key={c} value={c}>{c}</SelectItem>)}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                </div>
-
-                <div className="space-y-4">
-                  <Label>Packages</Label>
-                  {pricing.packages.map(p => (
-                    <div key={p.id} className="grid grid-cols-1 md:grid-cols-5 gap-3 items-end">
-                      <div>
-                        <Label>Label</Label>
-                        <Input value={p.label} onChange={e => updatePkg(p.id, { label: e.target.value })} />
-                      </div>
-                      <div>
-                        <Label>Minutes</Label>
-                        <Input type="number" min={15} value={p.minutes} onChange={e => updatePkg(p.id, { minutes: Number(e.target.value) })} />
-                      </div>
-                      <div>
-                        <Label>Price</Label>
-                        <Input type="number" min={0} value={p.price} onChange={e => updatePkg(p.id, { price: Number(e.target.value) })} />
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <Switch checked={p.active} onCheckedChange={(v) => updatePkg(p.id, { active: v })} />
-                        <span className="text-sm">Active</span>
-                      </div>
-                      <div className="text-right">
-                        <Button variant="ghost" onClick={() => setPricing(prev => ({ ...prev, packages: prev.packages.filter(x => x.id !== p.id) }))}>Remove</Button>
-                      </div>
-                    </div>
-                  ))}
-                  <Button variant="outline" onClick={() => setPricing(prev => ({ ...prev, packages: [...prev.packages, defaultPkg(crypto.randomUUID(), "Custom", 30, 30, pricing.currency) ] }))}>Add Package</Button>
-                </div>
-              </div>
-            )}
-
-            {step === 4 && (
-              <div className="space-y-6">
-                <div className="flex items-center gap-4">
-                  <Label>Buffer between sessions (minutes)</Label>
-                  <Input type="number" min={0} className="w-32" value={availability.bufferMinutes} onChange={e => setAvailability(prev => ({ ...prev, bufferMinutes: Number(e.target.value) }))} />
-                </div>
-
-                <div className="space-y-4">
-                  <div className="flex items-center justify-between">
-                    <Label>Weekly Recurring Schedule</Label>
-                    <Button variant="outline" size="sm" onClick={addWeeklyRow}>Add Row</Button>
-                  </div>
-                  {availability.weekly.map(w => (
-                    <div key={w.id} className="grid grid-cols-1 md:grid-cols-5 gap-3 items-end">
-                      <div>
-                        <Label>Day</Label>
-                        <Select value={String(w.weekday)} onValueChange={(v)=> updateWeekly(w.id, { weekday: Number(v) })}>
-                          <SelectTrigger><SelectValue /></SelectTrigger>
-                          <SelectContent>
-                            {["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map((d,i)=>(<SelectItem key={i} value={String(i)}>{d}</SelectItem>))}
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      <div>
-                        <Label>Start</Label>
-                        <Input type="time" value={w.start} onChange={e=> updateWeekly(w.id, { start: e.target.value })} />
-                      </div>
-                      <div>
-                        <Label>End</Label>
-                        <Input type="time" value={w.end} onChange={e=> updateWeekly(w.id, { end: e.target.value })} />
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <Switch checked={w.active} onCheckedChange={(v)=> updateWeekly(w.id, { active: v })} />
-                        <span className="text-sm">Active</span>
-                      </div>
-                      <div className="text-right">
-                        <Button variant="ghost" onClick={() => removeWeekly(w.id)}>Remove</Button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-
-                <div className="space-y-3">
-                  <Label>Time-off (vacations/holidays)</Label>
-                  <div className="text-sm text-muted-foreground">Add blocked-out date ranges from your calendar in the next iteration.</div>
-                </div>
-              </div>
-            )}
-
-            {step === 5 && (
-              <div className="space-y-6">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                  <div>
-                    <Label>Payout Provider</Label>
-                    <Select value={payout.provider} onValueChange={(v)=> setPayout(prev => ({ ...prev, provider: v as any }))}>
-                      <SelectTrigger><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="stripe">Stripe</SelectItem>
-                        <SelectItem value="paypal">PayPal</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div>
-                    <Label>Account ID / Email</Label>
-                    <Input placeholder="Stripe account ID or PayPal email" value={payout.accountId} onChange={e => setPayout(prev => ({ ...prev, accountId: e.target.value }))} />
-                  </div>
-                </div>
-                <div className="flex items-center gap-3">
-                  <Switch checked={payout.connected} onCheckedChange={(v)=> setPayout(prev => ({ ...prev, connected: v }))} />
-                  <span className="text-sm">Connected</span>
+                <div className="flex justify-between">
+                  <Button variant="ghost" onClick={back}>
+                    Back
+                  </Button>
+                  <Button onClick={next} disabled={submitting}>
+                    {submitting ? "Submitting…" : "Submit Application"}
+                  </Button>
                 </div>
               </div>
             )}
           </CardContent>
         </Card>
-
-        <div className="flex items-center justify-between">
-          <Button variant="ghost" onClick={handleBack} disabled={step === 1}>Back</Button>
-          {step < 5 ? (
-            <Button onClick={handleNext}>Next</Button>
-          ) : (
-            <Button className="bg-primary text-primary-foreground" onClick={saveAll}>
-              Submit for Approval
-            </Button>
-          )}
-        </div>
       </div>
     </>
   );

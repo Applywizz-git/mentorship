@@ -256,3 +256,47 @@ export interface ContactForm {
   email: string;
   issue: string;
 }
+// Add/extend these types
+
+// src/lib/types.ts
+
+export type Role = 'mentor' | 'client' | 'admin';
+export type ApplicationStatus = 'pending' | 'approved' | 'rejected';
+
+export interface Profile {
+  id: string;                 // usually = auth user id
+  user_id: string;            // auth user id
+  name: string | null;
+  email: string | null;
+  phone: string | null;       // NEW (added in SQL)
+  role: Role | null;
+  avatar?: string | null;
+  company?: string | null;
+  experience?: number | null; // years
+  bio?: string | null;
+  specialties?: string[] | null; // prefer text[] in DB
+  verified?: boolean | null;  // true after admin approval
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface Mentor {
+  id: string;
+  user_id: string | null;           // null for pre-approval applicants (no account yet)
+  profile_id: string | null;        // null for pre-approval applicants
+  resume_url?: string | null;       // private storage path in 'resumes' bucket
+  application_status: ApplicationStatus; // pending | approved | rejected
+
+  // Applicant-only fields (public “apply without login”)
+  applicant_email?: string | null;
+  applicant_phone?: string | null;
+  applicant_name?: string | null;
+
+  // Lifecycle flags/timestamps
+  invited?: boolean;                // admin invited via auth.admin.inviteUserByEmail
+  invite_sent_at?: string | null;
+  approved_at?: string | null;
+
+  created_at?: string;
+  updated_at?: string;
+}

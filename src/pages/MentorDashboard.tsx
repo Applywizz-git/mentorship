@@ -473,14 +473,19 @@ import {
   getMentor,
   listBookings,
   listSlotsForMentor,
-  rescheduleBooking,
+     // (kept)
   updateMentorProfile,
   getMyMentorId,                 // (already imported)
-  listUpcomingForMentor          // (already imported)
+  listUpcomingForMentor,          // (already imported)
+  rescheduleBookingDb,
+  confirmBookingDb,
+  setCurrentMentorId,               // ✅ NEW
+  declineBookingDb                // ✅ NEW
 } from "@/lib/data";
 import type { Booking, TimeSlot, Mentor, SessionPackage, WeeklySlot } from "@/lib/types";
 import { useToast } from "@/hooks/use-toast";
 import AvailabilityCalendar from "@/components/AvailabilityCalendar";
+import MentorGate from "@/components/MentorGate"; // ✅ ADDED
 
 const MentorDashboard = () => {
   const [mentor, setMentor] = useState<Mentor | null>(null);
@@ -510,30 +515,44 @@ const MentorDashboard = () => {
   const [pending, setPending] = useState(0);
   const [tx, setTx] = useState<{id:string; date:string; client:string; amount:number; status:"pending"|"paid"}[]>([]);
 
-  // ✅ NEW: DB-backed upcoming rows
+  // ✅ DB-backed upcoming rows
   const [upcoming, setUpcoming] = useState<any[]>([]);
 
-  // ✅ Load upcoming (DB) and cache a valid mentorId if needed
-  useEffect(() => {
-    (async () => {
-      let mentorId = getCurrentMentorId?.() || "";
-      if (!mentorId || mentorId === "fallback") {
-        mentorId = (await getMyMentorId()) || "";
-      }
-      if (!mentorId) return;
-
-      try {
-        const rows = await listUpcomingForMentor(mentorId);
-        setUpcoming(rows);
-        // console.log("[Upcoming] mentorId:", mentorId, "rows:", rows);
-      } catch (e) {
-        console.error("Upcoming load failed", e);
-      }
-    })();
-  }, []);
+  // ✅ NEW: Pending requests for this mentor
+  const [pendingBookings, setPendingBookings] = useState<Booking[]>([]);
+  const [declineNote, setDeclineNote] = useState<string>("");
 
   const { toast } = useToast();
 
+  // ✅ Load upcoming (DB) and cache a valid mentorId if needed
+  useEffect(() => {
+  (async () => {
+    // try cached
+    let mentorId = getCurrentMentorId();
+
+    // resolve if missing
+    if (!mentorId) {
+      const resolved = await getMyMentorId();
+      if (!resolved) {
+        // not a mentor or no mentor row yet — do not query
+        return;
+      }
+      mentorId = resolved;
+      setCurrentMentorId(mentorId); // cache it for next time
+    }
+
+    // ✅ only now run queries that require a UUID
+    const [mentorData, mentorBookings, mentorSlots] = await Promise.all([
+      getMentor(mentorId),
+      listBookings({ mentorId }),
+      listSlotsForMentor(mentorId),
+    ]);
+
+    // ...set state...
+  })();
+}, []);
+
+  // Main load (mentor, all bookings, slots, pending requests, earnings init)
   useEffect(() => {
     (async () => {
       // ✅ ensure we have a real mentor id even if cache was empty
@@ -555,6 +574,10 @@ const MentorDashboard = () => {
 
       const mentorBookings = await listBookings({ mentorId: currentMentorId });
       setBookings(mentorBookings);
+
+      // ✅ load PENDING requests
+      const pend = await listBookings({ mentorId: currentMentorId, status: "pending" as any });
+      setPendingBookings(pend);
 
       const mentorSlots = await listSlotsForMentor(currentMentorId);
       setSlots(mentorSlots);
@@ -597,6 +620,20 @@ const MentorDashboard = () => {
     })();
   }, []);
 
+  // Helper to refresh after actions
+  const refreshAll = async (mid: string) => {
+    const [allB, pendB, sl, upc] = await Promise.all([
+      listBookings({ mentorId: mid }),
+      listBookings({ mentorId: mid, status: "pending" as any }),
+      listSlotsForMentor(mid),
+      listUpcomingForMentor(mid),
+    ]);
+    setBookings(allB);
+    setPendingBookings(pendB);
+    setSlots(sl);
+    setUpcoming(upc);
+  };
+
   const formatDateTime = (isoString: string) => {
     const date = new Date(isoString);
     return {
@@ -631,20 +668,19 @@ const MentorDashboard = () => {
     const reason = within24h ? rescheduleReason.trim() : undefined;
 
     try {
-      await rescheduleBooking(selectedBooking.id, newSlotId, reason);
+      await rescheduleBookingDb(selectedBooking.id, newSlotId, reason);
+      const { toast } = await import("@/hooks/use-toast");
       toast({ title: "Session rescheduled!", description: "The mentee has been notified of the change." });
 
       if (mentor) {
-        const refreshedBookings = await listBookings({ mentorId: mentor.id });
-        setBookings(refreshedBookings);
-        const refreshedSlots = await listSlotsForMentor(mentor.id);
-        setSlots(refreshedSlots);
+        await refreshAll(mentor.id); // ✅ also refresh upcoming & pending
       }
 
       setSelectedBooking(null);
       setNewSlotId("");
       setRescheduleReason("");
     } catch (e: any) {
+      const { toast } = await import("@/hooks/use-toast");
       toast({ title: "Reschedule failed", description: e?.message ?? "Please try another slot.", variant: "destructive" });
     }
   };
@@ -653,6 +689,7 @@ const MentorDashboard = () => {
     if (!mentor) return;
     updateMentorProfile(mentor.id, profileData);
     setMentor({ ...mentor, ...profileData });
+    const { toast } = require("@/hooks/use-toast");
     toast({ title: "Profile updated!", description: "Your profile information has been saved." });
     setEditProfileOpen(false);
   };
@@ -674,6 +711,7 @@ const MentorDashboard = () => {
     }));
     updateMentorProfile(mentor.id, { packages: normalized });
     setMentor({ ...mentor, packages: normalized });
+    const { toast } = require("@/hooks/use-toast");
     toast({ title: "Pricing updated", description: "Your session packages were saved." });
   };
 
@@ -688,15 +726,20 @@ const MentorDashboard = () => {
     if (!mentor) return;
     updateMentorProfile(mentor.id, { weeklySchedule: weeklyEdit, bufferMinutes: bufferEdit });
     setMentor({ ...mentor, weeklySchedule: weeklyEdit, bufferMinutes: bufferEdit });
+    const { toast } = require("@/hooks/use-toast");
     toast({ title: "Availability updated", description: "Your weekly schedule was saved." });
   };
 
   // ✅ Prefer DB-backed upcoming; if empty, fall back to legacy local computation
+  //    Also ensure ONLY CONFIRMED appear in upcoming
   const legacyUpcoming = bookings.filter(b => {
-    const slot = getBookingSlot(b.slotId);
-    return slot && new Date(slot.startIso) > new Date();
-  });
-  const upcomingBookings = (upcoming && upcoming.length > 0) ? upcoming : legacyUpcoming;
+  const slot = getBookingSlot(b.slotId);
+  return b.status === "confirmed" && slot && new Date(slot.startIso) > new Date();
+});
+
+const upcomingBookings = (upcoming && upcoming.length > 0)
+  ? upcoming.filter((b: any) => b.status === "confirmed" && new Date(b.startIso) > new Date())
+  : legacyUpcoming;
 
   if (!mentor) {
     return (
@@ -712,449 +755,522 @@ const MentorDashboard = () => {
   }
 
   return (
-    <div className="min-h-screen bg-background">
-      <Navbar />
+    <MentorGate>
+      <div className="min-h-screen bg-background">
+        <Navbar />
 
-      <div className="px-6 py-8">
-        <div className="max-w-6xl mx-auto">
-          {/* Header */}
-          <div className="flex items-center justify-between mb-8">
-            <div>
-              <h1 className="text-3xl font-bold text-foreground mb-2">Welcome back, {mentor.name}</h1>
-              <p className="text-muted-foreground">{mentor.title} at {mentor.company}</p>
+        <div className="px-6 py-8">
+          <div className="max-w-6xl mx-auto">
+            {/* Header */}
+            <div className="flex items-center justify-between mb-8">
+              <div>
+                <h1 className="text-3xl font-bold text-foreground mb-2">Welcome back, {mentor.name}</h1>
+                <p className="text-muted-foreground">{mentor.title} at {mentor.company}</p>
+              </div>
+              <div className="flex items-center gap-2">
+                {(mentor.status === 'pending' || mentor.status === 'pending_approval') ? (
+                  <Badge className="bg-yellow-100 text-yellow-800 border border-yellow-300">⏳ Pending Approval</Badge>
+                ) : mentor.verified ? (
+                  <Badge className="bg-verified-green text-white">✓ Verified</Badge>
+                ) : null}
+                <Badge variant="secondary">{mentor.rating} rating</Badge>
+              </div>
             </div>
-            <div className="flex items-center gap-2">
-              {(mentor.status === 'pending' || mentor.status === 'pending_approval') ? (
-                <Badge className="bg-yellow-100 text-yellow-800 border border-yellow-300">⏳ Pending Approval</Badge>
-              ) : mentor.verified ? (
-                <Badge className="bg-verified-green text-white">✓ Verified</Badge>
-              ) : null}
-              <Badge variant="secondary">{mentor.rating} rating</Badge>
-            </div>
-          </div>
 
-          {/* Pending banner */}
-          {(mentor.status === 'pending' || mentor.status === 'pending_approval') && (
-            <div className="mb-6 rounded-lg border border-yellow-300 bg-yellow-50 text-yellow-800 p-3 text-sm">
-              Your profile is <b>Pending Approval</b>. You can still update availability & pricing,
-              but you won’t appear in search until approved.
-              <Button
-                variant="link"
-                className="ml-2 p-0 align-baseline"
-                onClick={() => (window.location.href = "/become-mentor")}
-              >
-                Edit onboarding
-              </Button>
-            </div>
-          )}
+            {/* Pending banner */}
+            {(mentor.status === 'pending' || mentor.status === 'pending_approval') && (
+              <div className="mb-6 rounded-lg border border-yellow-300 bg-yellow-50 text-yellow-800 p-3 text-sm">
+                Your profile is <b>Pending Approval</b>. You can still update availability & pricing,
+                but you won’t appear in search until approved.
+                <Button
+                  variant="link"
+                  className="ml-2 p-0 align-baseline"
+                  onClick={() => (window.location.href = "/become-mentor")}
+                >
+                  Edit onboarding
+                </Button>
+              </div>
+            )}
 
-          {/* Dashboard Tabs */}
-          <Tabs defaultValue="upcoming" className="space-y-6">
-            <TabsList className="grid w-full grid-cols-7">
-              <TabsTrigger value="requests">Requests</TabsTrigger>
-              <TabsTrigger value="upcoming">Upcoming</TabsTrigger>
-              <TabsTrigger value="past">Past</TabsTrigger>
-              <TabsTrigger value="profile">Profile</TabsTrigger>
-              <TabsTrigger value="availability">Availability</TabsTrigger>
-              <TabsTrigger value="pricing">Pricing</TabsTrigger>
-              <TabsTrigger value="earnings">Earnings</TabsTrigger>
-            </TabsList>
+            {/* Dashboard Tabs */}
+            <Tabs defaultValue="upcoming" className="space-y-6">
+              <TabsList className="grid w-full grid-cols-7">
+                <TabsTrigger value="requests">Requests</TabsTrigger>
+                <TabsTrigger value="upcoming">Upcoming</TabsTrigger>
+                <TabsTrigger value="past">Past</TabsTrigger>
+                <TabsTrigger value="profile">Profile</TabsTrigger>
+                <TabsTrigger value="availability">Availability</TabsTrigger>
+                <TabsTrigger value="pricing">Pricing</TabsTrigger>
+                <TabsTrigger value="earnings">Earnings</TabsTrigger>
+              </TabsList>
 
-            <TabsContent value="requests">
-              <Card>
-                <CardHeader>
-                  <CardTitle>Booking Requests</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className="text-center py-8">
-                    <p className="text-muted-foreground">No pending booking requests</p>
-                    <p className="text-sm text-muted-foreground mt-2">New requests will appear here</p>
-                  </div>
-                </CardContent>
-              </Card>
-            </TabsContent>
+              {/* ✅ Requests tab now shows real pending items with Confirm/Decline */}
+              <TabsContent value="requests">
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Booking Requests</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    {pendingBookings.length === 0 ? (
+                      <div className="text-center py-8">
+                        <p className="text-muted-foreground">No pending booking requests</p>
+                        <p className="text-sm text-muted-foreground mt-2">New requests will appear here</p>
+                      </div>
+                    ) : (
+                      <div className="space-y-4">
+                        {pendingBookings.map((b) => {
+                          const slot = getBookingSlot(b.slotId) || slots.find(s => s.id === b.slotId);
+                          const d = slot ? new Date(slot.startIso) : null;
+                          const when = d
+                            ? `${d.toLocaleDateString(undefined, { month: "short", day: "numeric", weekday: "short" })} · ${d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`
+                            : "(time not loaded)";
 
-            <TabsContent value="upcoming">
-              <Card>
-                <CardHeader>
-                  <CardTitle className="flex items-center gap-2">
-                    <Calendar className="w-5 h-5" />
-                    {/* ✅ counts DB-backed list when available */}
-                    Upcoming Sessions ({upcomingBookings.length})
-                  </CardTitle>
-                </CardHeader>
-                <CardContent>
-                  {upcomingBookings.length === 0 ? (
-                    <div className="text-center py-8">
-                      <p className="text-muted-foreground">No upcoming sessions</p>
-                      <p className="text-sm text-muted-foreground mt-2">New bookings will appear here</p>
-                    </div>
-                  ) : (
-                    <div className="space-y-4">
-                      {upcomingBookings.map((booking: any) => {
-                        // ✅ Prefer startIso from DB-backed 'upcoming'; else fall back to local slot lookup
-                        const startIso: string =
-                          booking.startIso ||
-                          getBookingSlot(booking.slotId)?.startIso ||
-                          "";
-
-                        if (!startIso) return null;
-                        const { date, time } = formatDateTime(startIso);
-
-                        return (
-                          <div key={booking.id} className="flex items-center justify-between p-4 border border-border rounded-lg">
-                            <div className="flex items-center gap-4">
-                              <div className="p-2 bg-primary/10 rounded-lg">
-                                <User className="w-5 h-5 text-primary" />
-                              </div>
-                              <div>
-                                {/* demo data stores only clientId; show it */}
-                                <h4 className="font-medium">{booking.clientId}</h4>
-                                <div className="flex items-center gap-4 mt-1 text-sm text-muted-foreground">
-                                  <span className="flex items-center gap-1">
-                                    <Calendar className="w-3 h-3" />
-                                    {date}
-                                  </span>
-                                  <span className="flex items-center gap-1">
-                                    <Clock className="w-3 h-3" />
-                                    {time}
-                                  </span>
-                                </div>
-                              </div>
-                            </div>
-
-                            <div className="flex items-center gap-2">
-                              <Badge variant={booking.status === 'confirmed' ? 'default' : 'secondary'}>
-                                {booking.status}
-                              </Badge>
-
-                              <Dialog>
-                                <DialogTrigger asChild>
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    onClick={() => setSelectedBooking(booking)}
-                                  >
-                                    Reschedule
-                                  </Button>
-                                </DialogTrigger>
-                                <DialogContent>
-                                  <DialogHeader>
-                                    <DialogTitle>Reschedule Session</DialogTitle>
-                                  </DialogHeader>
-                                  <div className="space-y-4">
-                                    <div>
-                                      <Label>Current Session</Label>
-                                      <p className="text-sm text-muted-foreground">
-                                        {booking.clientId} - {date} at {time}
-                                      </p>
-                                    </div>
-
-                                    <div>
-                                      <Label>New Time Slot</Label>
-                                      <Select value={newSlotId} onValueChange={setNewSlotId}>
-                                        <SelectTrigger>
-                                          <SelectValue placeholder="Select new time slot" />
-                                        </SelectTrigger>
-                                        <SelectContent>
-                                          {getAvailableSlots(booking.slotId).map((slot) => {
-                                            const { date: newDate, time: newTime } = formatDateTime(slot.startIso);
-                                            return (
-                                              <SelectItem key={slot.id} value={slot.id}>
-                                                {newDate} at {newTime}
-                                              </SelectItem>
-                                            );
-                                          })}
-                                        </SelectContent>
-                                      </Select>
-                                    </div>
-
-                                    {isWithin24Hours(booking.slotId) && (
-                                      <div>
-                                        <Label>Reason (Required for last-minute changes)</Label>
-                                        <Textarea
-                                          value={rescheduleReason}
-                                          onChange={(e) => setRescheduleReason(e.target.value)}
-                                          placeholder="Please provide a reason for the reschedule..."
-                                        />
-                                      </div>
-                                    )}
-
-                                    <div className="flex gap-2">
-                                      <Button
-                                        onClick={handleReschedule}
-                                        disabled={!newSlotId || (isWithin24Hours(booking.slotId) && !rescheduleReason.trim())}
-                                        className="flex-1"
-                                      >
-                                        Confirm Reschedule
-                                      </Button>
-                                    </div>
-                                  </div>
-                                </DialogContent>
-                              </Dialog>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
-            </TabsContent>
-
-            <TabsContent value="past">
-              <Card>
-                <CardHeader>
-                  <CardTitle>Past Sessions</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  {bookings.filter(b => {
-                    const slot = getBookingSlot(b.slotId);
-                    return slot && new Date(slot.startIso) <= new Date();
-                  }).length === 0 ? (
-                    <div className="text-center py-8 text-muted-foreground">
-                      No past sessions yet.
-                    </div>
-                  ) : (
-                    <div className="space-y-3">
-                      {bookings
-                        .filter(b => {
-                          const slot = getBookingSlot(b.slotId);
-                          return slot && new Date(slot.startIso) <= new Date();
-                        })
-                        .map((b) => {
-                          const slot = getBookingSlot(b.slotId)!;
-                          const { date, time } = formatDateTime(slot.startIso);
                           return (
-                            <div key={b.id} className="flex items-center justify-between p-4 border border-border rounded-lg">
+                            <div key={b.id} className="p-4 border rounded flex items-start justify-between gap-4">
                               <div>
-                                <div className="font-medium">{b.clientId}</div>
-                                <div className="text-sm text-muted-foreground">{date} • {time}</div>
+                                <div className="font-medium">Client: {b.clientId}</div>
+                                <div className="text-sm text-muted-foreground">{when}</div>
                               </div>
                               <div className="flex items-center gap-2">
-                                <Badge variant={b.status === 'cancelled' ? 'secondary' : 'default'}>{b.status}</Badge>
-                                <Button variant="outline" size="sm">View Feedback</Button>
+                                <Button
+                                  onClick={async () => {
+                                    try {
+                                      await confirmBookingDb(b.id);
+                                      toast({ title: "Booking confirmed" });
+                                      await refreshAll(mentor.id);
+                                    } catch (e: any) {
+                                      toast({ title: "Confirm failed", description: e?.message ?? "Try again.", variant: "destructive" });
+                                    }
+                                  }}
+                                >
+                                  Confirm
+                                </Button>
+
+                                <Dialog>
+                                  <DialogTrigger asChild>
+                                    <Button variant="destructive">Decline</Button>
+                                  </DialogTrigger>
+                                  <DialogContent>
+                                    <DialogHeader>
+                                      <DialogTitle>Decline Booking</DialogTitle>
+                                    </DialogHeader>
+                                    <div className="space-y-3">
+                                      <p className="text-sm text-muted-foreground">
+                                        Optionally add a note for the client:
+                                      </p>
+                                      <Textarea value={declineNote} onChange={(e) => setDeclineNote(e.target.value)} />
+                                      <div className="flex gap-2 justify-end">
+                                        <Button variant="outline" onClick={() => setDeclineNote("")}>Cancel</Button>
+                                        <Button
+                                          variant="destructive"
+                                          onClick={async () => {
+                                            try {
+                                              await declineBookingDb(b.id, declineNote.trim() || undefined);
+                                              setDeclineNote("");
+                                              toast({ title: "Booking declined" });
+                                              await refreshAll(mentor.id); // slot freed & lists updated
+                                            } catch (e: any) {
+                                              toast({ title: "Decline failed", description: e?.message ?? "Try again.", variant: "destructive" });
+                                            }
+                                          }}
+                                        >
+                                          Confirm decline
+                                        </Button>
+                                      </div>
+                                    </div>
+                                  </DialogContent>
+                                </Dialog>
                               </div>
                             </div>
                           );
                         })}
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
-            </TabsContent>
-
-            <TabsContent value="profile">
-              <Card>
-                <CardHeader>
-                  <CardTitle className="flex items-center gap-2">
-                    <Settings className="w-5 h-5" />
-                    Profile Settings
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-6">
-                  <div className="flex items-center gap-4">
-                    <img
-                      src={mentor.avatar}
-                      alt={mentor.name}
-                      className="w-20 h-20 rounded-full object-cover"
-                    />
-                    <div>
-                      <h3 className="text-lg font-semibold">{mentor.name}</h3>
-                      <p className="text-muted-foreground">{mentor.title}</p>
-                      {(mentor.status === 'pending' || mentor.status === 'pending_approval')
-                        ? <Badge className="mt-1 bg-yellow-100 text-yellow-800 border border-yellow-300">⏳ Pending Approval</Badge>
-                        : <Badge className="mt-1 bg-verified-green text-white">✓ Verified</Badge>
-                      }
-                    </div>
-                  </div>
-
-                  <div className="grid md:grid-cols-2 gap-6">
-                    <div>
-                      <h4 className="font-medium mb-2">Profile Information</h4>
-                      <div className="space-y-2 text-sm">
-                        <p><span className="font-medium">Name:</span> {mentor.name}</p>
-                        <p><span className="font-medium">Title:</span> {mentor.title}</p>
-                        <p><span className="font-medium">Company:</span> {mentor.company}</p>
-                        <p><span className="font-medium">Experience:</span> {mentor.experience} years</p>
-                        <p><span className="font-medium">Rating:</span> {mentor.rating}/5.0 ({mentor.reviews} reviews)</p>
-                      </div>
-                    </div>
-
-                    <div>
-                      <h4 className="font-medium mb-2">Specialties</h4>
-                      <div className="flex flex-wrap gap-2">
-                        {mentor.specialties.map((specialty) => (
-                          <Badge key={specialty} variant="secondary">
-                            {specialty}
-                          </Badge>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-
-                  <Dialog open={editProfileOpen} onOpenChange={setEditProfileOpen}>
-                    <DialogTrigger asChild>
-                      <Button>Edit Profile Details</Button>
-                    </DialogTrigger>
-                    <DialogContent>
-                      <DialogHeader>
-                        <DialogTitle>Edit Profile</DialogTitle>
-                      </DialogHeader>
-                      <div className="space-y-4">
-                        <div>
-                          <Label htmlFor="name">Name</Label>
-                          <Input
-                            id="name"
-                            value={profileData.name}
-                            onChange={(e) => setProfileData({ ...profileData, name: e.target.value })}
-                          />
-                        </div>
-                        <div>
-                          <Label htmlFor="title">Title</Label>
-                          <Input
-                            id="title"
-                            value={profileData.title}
-                            onChange={(e) => setProfileData({ ...profileData, title: e.target.value })}
-                          />
-                        </div>
-                        <div>
-                          <Label htmlFor="company">Company</Label>
-                          <Input
-                            id="company"
-                            value={profileData.company}
-                            onChange={(e) => setProfileData({ ...profileData, company: e.target.value })}
-                          />
-                        </div>
-                        <Button onClick={handleSaveProfile} className="w-full">
-                          Save Changes
-                        </Button>
-                      </div>
-                    </DialogContent>
-                  </Dialog>
-                </CardContent>
-              </Card>
-            </TabsContent>
-
-            <TabsContent value="availability" className="p-4">
-              <h2 className="text-xl font-semibold mb-4">Availability Management</h2>
-              {getCurrentMentorId() ? (
-                <AvailabilityCalendar mentorId={getCurrentMentorId()} />
-              ) : (
-                <p className="text-sm text-muted-foreground">Loading mentor profile…</p>
-              )}
-            </TabsContent>
-
-            <TabsContent value="pricing">
-              <Card>
-                <CardHeader>
-                  <CardTitle>Pricing & Packages</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-4">
-                  <div>
-                    <Label>Currency</Label>
-                    <Input value={currency} onChange={e => setCurrency(e.target.value.toUpperCase())} placeholder="USD / INR" />
-                  </div>
-                  {([30,45,60] as const).map(mins => {
-                    const pkg = packagesState.find(p => p.minutes === mins) ||
-                      { id: `pkg-${mins}`, label: `${mins} min`, minutes: mins, price: 0, currency: currency as any, active: false };
-                    return (
-                      <div key={mins} className="grid md:grid-cols-3 gap-4 items-center">
-                        <div className="text-sm font-medium">{mins} min</div>
-                        <div className="flex items-center gap-2">
-                          <Badge variant="secondary">{pkg.active ? "Active" : "Inactive"}</Badge>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => togglePackageActive(mins as 30|45|60, !pkg.active)}
-                          >
-                            {pkg.active ? "Deactivate" : "Activate"}
-                          </Button>
-                        </div>
-                        <div>
-                          <Label>Price ({currency})</Label>
-                          <Input
-                            type="number"
-                            min={0}
-                            value={pkg.price}
-                            onChange={e => setPackagePrice(mins as 30|45|60, parseFloat(e.target.value || "0"))}
-                          />
-                        </div>
-                      </div>
-                    );
-                  })}
-                  <div className="flex justify-end">
-                    <Button onClick={savePricing}>Save Pricing</Button>
-                  </div>
-                </CardContent>
-              </Card>
-            </TabsContent>
-
-            <TabsContent value="earnings">
-              <Card>
-                <CardHeader>
-                  <CardTitle>Earnings</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-6">
-                  <div className="grid md:grid-cols-3 gap-4">
-                    <div className="p-4 rounded-lg border">
-                      <div className="text-sm text-muted-foreground">Month to date</div>
-                      <div className="text-2xl font-bold">${mtd}</div>
-                    </div>
-                    <div className="p-4 rounded-lg border">
-                      <div className="text-sm text-muted-foreground">Lifetime</div>
-                      <div className="text-2xl font-bold">${lifetime}</div>
-                    </div>
-                    <div className="p-4 rounded-lg border">
-                      <div className="text-sm text-muted-foreground">Pending payouts</div>
-                      <div className="text-2xl font-bold">${pending}</div>
-                    </div>
-                  </div>
-
-                  <div>
-                    <h4 className="font-medium mb-3">Transactions</h4>
-                    {tx.length === 0 ? (
-                      <div className="text-sm text-muted-foreground">No transactions yet.</div>
-                    ) : (
-                      <div className="overflow-x-auto">
-                        <table className="w-full text-sm">
-                          <thead>
-                            <tr className="text-left text-muted-foreground border-b">
-                              <th className="py-2 pr-2">Booking ID</th>
-                              <th className="py-2 pr-2">Date</th>
-                              <th className="py-2 pr-2">Client</th>
-                              <th className="py-2 pr-2">Amount</th>
-                              <th className="py-2 pr-2">Status</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {tx.map(row => (
-                              <tr key={row.id} className="border-b last:border-0">
-                                <td className="py-2 pr-2">{row.id}</td>
-                                <td className="py-2 pr-2">{new Date(row.date).toLocaleString()}</td>
-                                <td className="py-2 pr-2">{row.client}</td>
-                                <td className="py-2 pr-2">${row.amount}</td>
-                                <td className="py-2 pr-2">
-                                  <Badge variant={row.status === "pending" ? "secondary" : "default"}>
-                                    {row.status}
-                                  </Badge>
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
                       </div>
                     )}
-                  </div>
-                </CardContent>
-              </Card>
-            </TabsContent>
-          </Tabs>
+                  </CardContent>
+                </Card>
+              </TabsContent>
+
+              <TabsContent value="upcoming">
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <Calendar className="w-5 h-5" />
+                      {/* ✅ counts CONFIRMED only */}
+                      Upcoming Sessions ({upcomingBookings.length})
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    {upcomingBookings.length === 0 ? (
+                      <div className="text-center py-8">
+                        <p className="text-muted-foreground">No upcoming sessions</p>
+                        <p className="text-sm text-muted-foreground mt-2">New bookings will appear here</p>
+                      </div>
+                    ) : (
+                      <div className="space-y-4">
+                        {upcomingBookings.map((booking: any) => {
+                          // Prefer startIso from DB-backed 'upcoming'; else fall back to local slot lookup
+                          const startIso: string =
+                            booking.startIso ||
+                            getBookingSlot(booking.slotId)?.startIso ||
+                            "";
+
+                          if (!startIso) return null;
+                          const { date, time } = formatDateTime(startIso);
+
+                          return (
+                            <div key={booking.id} className="flex items-center justify-between p-4 border border-border rounded-lg">
+                              <div className="flex items-center gap-4">
+                                <div className="p-2 bg-primary/10 rounded-lg">
+                                  <User className="w-5 h-5 text-primary" />
+                                </div>
+                                <div>
+                                  {/* demo data stores only clientId; show it */}
+                                  <h4 className="font-medium">{booking.clientId}</h4>
+                                  <div className="flex items-center gap-4 mt-1 text-sm text-muted-foreground">
+                                    <span className="flex items-center gap-1">
+                                      <Calendar className="w-3 h-3" />
+                                      {date}
+                                    </span>
+                                    <span className="flex items-center gap-1">
+                                      <Clock className="w-3 h-3" />
+                                      {time}
+                                    </span>
+                                  </div>
+                                </div>
+                              </div>
+
+                              <div className="flex items-center gap-2">
+                                <Badge variant={booking.status === 'confirmed' ? 'default' : 'secondary'}>
+                                  {booking.status}
+                                </Badge>
+
+                                <Dialog>
+                                  <DialogTrigger asChild>
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      onClick={() => setSelectedBooking(booking)}
+                                    >
+                                      Reschedule
+                                    </Button>
+                                  </DialogTrigger>
+                                  <DialogContent>
+                                    <DialogHeader>
+                                      <DialogTitle>Reschedule Session</DialogTitle>
+                                    </DialogHeader>
+                                    <div className="space-y-4">
+                                      <div>
+                                        <Label>Current Session</Label>
+                                        <p className="text-sm text-muted-foreground">
+                                          {booking.clientId} - {date} at {time}
+                                        </p>
+                                      </div>
+
+                                      <div>
+                                        <Label>New Time Slot</Label>
+                                        <Select value={newSlotId} onValueChange={setNewSlotId}>
+                                          <SelectTrigger>
+                                            <SelectValue placeholder="Select new time slot" />
+                                          </SelectTrigger>
+                                          <SelectContent>
+                                            {getAvailableSlots(booking.slotId).map((slot) => {
+                                              const { date: newDate, time: newTime } = formatDateTime(slot.startIso);
+                                              return (
+                                                <SelectItem key={slot.id} value={slot.id}>
+                                                  {newDate} at {newTime}
+                                                </SelectItem>
+                                              );
+                                            })}
+                                          </SelectContent>
+                                        </Select>
+                                      </div>
+
+                                      {isWithin24Hours(booking.slotId) && (
+                                        <div>
+                                          <Label>Reason (Required for last-minute changes)</Label>
+                                          <Textarea
+                                            value={rescheduleReason}
+                                            onChange={(e) => setRescheduleReason(e.target.value)}
+                                            placeholder="Please provide a reason for the reschedule..."
+                                          />
+                                        </div>
+                                      )}
+
+                                      <div className="flex gap-2">
+                                        <Button
+                                          onClick={handleReschedule}
+                                          disabled={!newSlotId || (isWithin24Hours(booking.slotId) && !rescheduleReason.trim())}
+                                          className="flex-1"
+                                        >
+                                          Confirm Reschedule
+                                        </Button>
+                                      </div>
+                                    </div>
+                                  </DialogContent>
+                                </Dialog>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+              </TabsContent>
+
+              <TabsContent value="past">
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Past Sessions</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    {bookings.filter(b => {
+                      const slot = getBookingSlot(b.slotId);
+                      return slot && new Date(slot.startIso) <= new Date();
+                    }).length === 0 ? (
+                      <div className="text-center py-8 text-muted-foreground">
+                        No past sessions yet.
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        {bookings
+                          .filter(b => {
+                            const slot = getBookingSlot(b.slotId);
+                            return slot && new Date(slot.startIso) <= new Date();
+                          })
+                          .map((b) => {
+                            const slot = getBookingSlot(b.slotId)!;
+                            const { date, time } = formatDateTime(slot.startIso);
+                            return (
+                              <div key={b.id} className="flex items-center justify-between p-4 border border-border rounded-lg">
+                                <div>
+                                  <div className="font-medium">{b.clientId}</div>
+                                  <div className="text-sm text-muted-foreground">{date} • {time}</div>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <Badge variant={b.status === 'cancelled' ? 'secondary' : 'default'}>{b.status}</Badge>
+                                  <Button variant="outline" size="sm">View Feedback</Button>
+                                </div>
+                              </div>
+                            );
+                          })}
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+              </TabsContent>
+
+              <TabsContent value="profile">
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <Settings className="w-5 h-5" />
+                      Profile Settings
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-6">
+                    <div className="flex items-center gap-4">
+                      <img
+                        src={mentor.avatar}
+                        alt={mentor.name}
+                        className="w-20 h-20 rounded-full object-cover"
+                      />
+                      <div>
+                        <h3 className="text-lg font-semibold">{mentor.name}</h3>
+                        <p className="text-muted-foreground">{mentor.title}</p>
+                        {(mentor.status === 'pending' || mentor.status === 'pending_approval')
+                          ? <Badge className="mt-1 bg-yellow-100 text-yellow-800 border border-yellow-300">⏳ Pending Approval</Badge>
+                          : <Badge className="mt-1 bg-verified-green text-white">✓ Verified</Badge>
+                        }
+                      </div>
+                    </div>
+
+                    <div className="grid md:grid-cols-2 gap-6">
+                      <div>
+                        <h4 className="font-medium mb-2">Profile Information</h4>
+                        <div className="space-y-2 text-sm">
+                          <p><span className="font-medium">Name:</span> {mentor.name}</p>
+                          <p><span className="font-medium">Title:</span> {mentor.title}</p>
+                          <p><span className="font-medium">Company:</span> {mentor.company}</p>
+                          <p><span className="font-medium">Experience:</span> {mentor.experience} years</p>
+                          <p><span className="font-medium">Rating:</span> {mentor.rating}/5.0 ({mentor.reviews} reviews)</p>
+                        </div>
+                      </div>
+
+                      <div>
+                        <h4 className="font-medium mb-2">Specialties</h4>
+                        <div className="flex flex-wrap gap-2">
+                          {mentor.specialties.map((specialty) => (
+                            <Badge key={specialty} variant="secondary">
+                              {specialty}
+                            </Badge>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+
+                    <Dialog open={editProfileOpen} onOpenChange={setEditProfileOpen}>
+                      <DialogTrigger asChild>
+                        <Button>Edit Profile Details</Button>
+                      </DialogTrigger>
+                      <DialogContent>
+                        <DialogHeader>
+                          <DialogTitle>Edit Profile</DialogTitle>
+                        </DialogHeader>
+                        <div className="space-y-4">
+                          <div>
+                            <Label htmlFor="name">Name</Label>
+                            <Input
+                              id="name"
+                              value={profileData.name}
+                              onChange={(e) => setProfileData({ ...profileData, name: e.target.value })}
+                            />
+                          </div>
+                          <div>
+                            <Label htmlFor="title">Title</Label>
+                            <Input
+                              id="title"
+                              value={profileData.title}
+                              onChange={(e) => setProfileData({ ...profileData, title: e.target.value })}
+                            />
+                          </div>
+                          <div>
+                            <Label htmlFor="company">Company</Label>
+                            <Input
+                              id="company"
+                              value={profileData.company}
+                              onChange={(e) => setProfileData({ ...profileData, company: e.target.value })}
+                            />
+                          </div>
+                          <Button onClick={handleSaveProfile} className="w-full">
+                            Save Changes
+                          </Button>
+                        </div>
+                      </DialogContent>
+                    </Dialog>
+                  </CardContent>
+                </Card>
+              </TabsContent>
+
+              <TabsContent value="availability" className="p-4">
+                <h2 className="text-xl font-semibold mb-4">Availability Management</h2>
+                {getCurrentMentorId() ? (
+                  <AvailabilityCalendar mentorId={getCurrentMentorId()} />
+                ) : (
+                  <p className="text-sm text-muted-foreground">Loading mentor profile…</p>
+                )}
+              </TabsContent>
+
+              <TabsContent value="pricing">
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Pricing & Packages</CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-4">
+                    <div>
+                      <Label>Currency</Label>
+                      <Input value={currency} onChange={e => setCurrency(e.target.value.toUpperCase())} placeholder="USD / INR" />
+                    </div>
+                    {([30,45,60] as const).map(mins => {
+                      const pkg = packagesState.find(p => p.minutes === mins) ||
+                        { id: `pkg-${mins}`, label: `${mins} min`, minutes: mins, price: 0, currency: currency as any, active: false };
+                      return (
+                        <div key={mins} className="grid md:grid-cols-3 gap-4 items-center">
+                          <div className="text-sm font-medium">{mins} min</div>
+                          <div className="flex items-center gap-2">
+                            <Badge variant="secondary">{pkg.active ? "Active" : "Inactive"}</Badge>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => togglePackageActive(mins as 30|45|60, !pkg.active)}
+                            >
+                              {pkg.active ? "Deactivate" : "Activate"}
+                            </Button>
+                          </div>
+                          <div>
+                            <Label>Price ({currency})</Label>
+                            <Input
+                              type="number"
+                              min={0}
+                              value={pkg.price}
+                              onChange={e => setPackagePrice(mins as 30|45|60, parseFloat(e.target.value || "0"))}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                    <div className="flex justify-end">
+                      <Button onClick={savePricing}>Save Pricing</Button>
+                    </div>
+                  </CardContent>
+                </Card>
+              </TabsContent>
+
+              <TabsContent value="earnings">
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Earnings</CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-6">
+                    <div className="grid md:grid-cols-3 gap-4">
+                      <div className="p-4 rounded-lg border">
+                        <div className="text-sm text-muted-foreground">Month to date</div>
+                        <div className="text-2xl font-bold">${mtd}</div>
+                      </div>
+                      <div className="p-4 rounded-lg border">
+                        <div className="text-sm text-muted-foreground">Lifetime</div>
+                        <div className="text-2xl font-bold">${lifetime}</div>
+                      </div>
+                      <div className="p-4 rounded-lg border">
+                        <div className="text-sm text-muted-foreground">Pending payouts</div>
+                        <div className="text-2xl font-bold">${pending}</div>
+                      </div>
+                    </div>
+
+                    <div>
+                      <h4 className="font-medium mb-3">Transactions</h4>
+                      {tx.length === 0 ? (
+                        <div className="text-sm text-muted-foreground">No transactions yet.</div>
+                      ) : (
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-sm">
+                            <thead>
+                              <tr className="text-left text-muted-foreground border-b">
+                                <th className="py-2 pr-2">Booking ID</th>
+                                <th className="py-2 pr-2">Date</th>
+                                <th className="py-2 pr-2">Client</th>
+                                <th className="py-2 pr-2">Amount</th>
+                                <th className="py-2 pr-2">Status</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {tx.map(row => (
+                                <tr key={row.id} className="border-b last:border-0">
+                                  <td className="py-2 pr-2">{row.id}</td>
+                                  <td className="py-2 pr-2">{new Date(row.date).toLocaleString()}</td>
+                                  <td className="py-2 pr-2">{row.client}</td>
+                                  <td className="py-2 pr-2">${row.amount}</td>
+                                  <td className="py-2 pr-2">
+                                    <Badge variant={row.status === "pending" ? "secondary" : "default"}>
+                                      {row.status}
+                                    </Badge>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
+                  </CardContent>
+                </Card>
+              </TabsContent>
+            </Tabs>
+          </div>
         </div>
       </div>
-    </div>
+    </MentorGate>
   );
 };
 
 export default MentorDashboard;
-
