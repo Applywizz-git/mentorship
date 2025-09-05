@@ -965,7 +965,7 @@ import { supabase } from "@/lib/supabase";
 const LS = (() => {
   try { return window?.localStorage ?? null } catch { return null }
 })();
-
+const MENTOR_ID_CACHE_KEY = "currentMentorId";
 const KEY = {
   users: 'mc.users',
   mentors: 'mc.mentors',
@@ -979,6 +979,7 @@ const KEY = {
 } as const;
 
 type Id = string;
+type ApplicationStatus = 'pending' | 'approved' | 'rejected';
 const nowIso = () => new Date().toISOString();
 const uuid = () => Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
 
@@ -1057,7 +1058,7 @@ export async function registerUser(args: {
     const { data: s2, error: e2 } = await supabase.auth.signInWithPassword({ email, password });
     if (e2) throw e2;
   }
-
+await claimApprovedMentorForCurrentUser();
   // 3) Get the authed user id
   const { data: uinfo } = await supabase.auth.getUser();
   const uid = uinfo?.user?.id;
@@ -1067,7 +1068,7 @@ export async function registerUser(args: {
   const { data: profUp, error: profErr } = await supabase
     .from("profiles")
     .upsert(
-      { user_id: uid, name: email.split("@")[0], email, role, verified: role === "client" },
+      { user_id: uid, name: email.split("@")[0], email, role, phone: mobile, verified: role === "client" },
       { onConflict: "user_id" }
     )
     .select("id")
@@ -1080,7 +1081,7 @@ export async function registerUser(args: {
     const { error: mErr } = await supabase
       .from("mentors")
       .upsert(
-        { user_id: uid, profile_id: profileId, availability: "high", reviews: 0 },
+        { user_id: uid, profile_id: profileId, availability: "high", reviews: 0, application_status: 'pending' as ApplicationStatus },
         { onConflict: "user_id" }
       );
     if (mErr) throw mErr;
@@ -1118,6 +1119,7 @@ export async function authenticateUser(email: string, password: string): Promise
 
   if (!existing) {
     const roleFromMeta = (uinfo.user?.user_metadata?.role as "client" | "mentor" | "admin") ?? "client";
+    const mobileFromMeta = (uinfo.user?.user_metadata?.mobile as string | undefined) ?? null;
     const nameFromEmail = (uinfo.user?.email ?? "").split("@")[0];
 
     const { data: prof, error: upErr } = await supabase
@@ -1128,6 +1130,7 @@ export async function authenticateUser(email: string, password: string): Promise
           name: nameFromEmail,
           email: uinfo.user?.email ?? "",
           role: roleFromMeta,
+          phone: mobileFromMeta,
           // new accounts visible only after admin approval
           verified: roleFromMeta === "client",
         },
@@ -1142,7 +1145,7 @@ export async function authenticateUser(email: string, password: string): Promise
       const { error: mErr } = await supabase
         .from("mentors")
         .upsert(
-          { user_id: uid, profile_id: prof.id, availability: "high", reviews: 0 },
+          { user_id: uid, profile_id: prof.id, availability: "high", reviews: 0, application_status: 'pending' as ApplicationStatus },
           { onConflict: "user_id" }
         );
       if (mErr) throw mErr;
@@ -1204,8 +1207,11 @@ export function setCurrentMentorId(id: string) { write(KEY.currentMentorId, id);
 /* ✅ Safer mentor ID handling */
 export function getCurrentMentorId(): string {
   const cached = read<string>(KEY.currentMentorId, "");
-  return cached || "fallback";
+  // never allow 'fallback' to leak into queries
+  if (!cached || cached === "fallback") return "";
+  return cached;
 }
+
 export async function getOrLoadMentorId(): Promise<string | null> {
   const cached = read<string>(KEY.currentMentorId, "");
   if (cached) return cached;
@@ -1217,15 +1223,113 @@ export async function getOrLoadMentorId(): Promise<string | null> {
 }
 
 /* =========================================================
+   1.b) NEW — Helpers for Become-a-Mentor flow (email/phone + resume)
+   ========================================================= */
+
+/** Step 1: Save Basic Info — email + mobile/phone */
+export async function saveBasicInfo({
+  profileId,
+  email,
+  mobile,
+  phone,          // <- also accept `phone` for callers that use this name
+  name,
+}: {
+  profileId: string;
+  email?: string | null;
+  mobile?: string | null;
+  phone?: string | null;   // <- added
+  name?: string | null;
+}) {
+  const phoneValue = (mobile ?? phone) ?? null; // prefer mobile, fall back to phone
+  const { error } = await supabase
+    .from("profiles")
+    .update({ email: email ?? null, phone: phoneValue, name: name ?? null })
+    .eq("id", profileId);
+  if (error) throw error;
+}
+
+/** Step 2: Upload resume (private bucket 'resumes'); return object key (NO 'resumes/' prefix) */
+export async function uploadResume(file: File, userId: string) {
+  const ext = file.name.split('.').pop()?.toLowerCase() || 'pdf';
+  // IMPORTANT: store as "<uid>/filename.pdf" so RLS policy (foldername(name))[1] = auth.uid() matches
+  const key = `${userId}/${Date.now()}-resume.${ext}`;
+  const { error } = await supabase.storage.from('resumes').upload(key, file, {
+    cacheControl: '3600',
+    upsert: false,
+    contentType: file.type || 'application/pdf',
+  });
+  if (error) throw error;
+  return key; // store this in mentors.resume_url
+}
+
+/** Generate short-lived link so Admin can preview a private resume */
+export async function getResumeSignedUrl(path: string, expiresInSeconds = 60) {
+  if (!path) return null;
+  const { data, error } = await supabase.storage.from('resumes').createSignedUrl(path, expiresInSeconds);
+  if (error) throw error;
+  return data.signedUrl;
+}
+
+/** Step 2/3 submit: create/update mentor application with resume + expertise, set status 'pending' */
+export async function upsertMentorApplication({
+  userId,
+  profileId,
+  resumePath,
+  specialties,
+  experience,
+}: {
+  userId: string;
+  profileId: string;
+  resumePath: string | null;
+  specialties?: string[];
+  experience?: number;
+}) {
+  if (!userId) throw new Error("Missing userId");
+  if (!profileId) throw new Error("Missing profileId");
+
+  // 1) keep profile in sync
+  const profileUpdate: any = {};
+  if (Array.isArray(specialties)) profileUpdate.specialties = specialties.length ? specialties : null;
+  if (typeof experience === "number") profileUpdate.experience = experience;
+
+  if (Object.keys(profileUpdate).length > 0) {
+    const { error: pErr } = await supabase.from("profiles").update(profileUpdate).eq("id", profileId);
+    if (pErr) throw pErr;
+  }
+
+  // 2) find an existing mentors row by user_id OR profile_id
+  const { data: existing, error: selErr } = await supabase
+    .from("mentors")
+    .select("id, user_id, profile_id")
+    .or(`user_id.eq.${userId},profile_id.eq.${profileId}`)
+    .maybeSingle();
+  if (selErr) throw selErr;
+
+  const payload = {
+    user_id: userId,                 // ✅ never null
+    profile_id: profileId,           // ✅ never null
+    resume_url: resumePath ?? null,
+    application_status: "pending" as const,
+  };
+
+  if (existing?.id) {
+    const { error: upErr } = await supabase.from("mentors").update(payload).eq("id", existing.id);
+    if (upErr) throw upErr;
+  } else {
+    const { error: insErr } = await supabase.from("mentors").insert(payload);
+    if (insErr) throw insErr;
+  }
+}
+/* =========================================================
    2) MENTORS — Supabase reads (kept same function names)
    ========================================================= */
 export async function listMentors(): Promise<Mentor[]> {
   const { data, error } = await supabase
     .from("mentors")
     .select(`
-      id, user_id, profile_id, availability, reviews,
+      id, user_id, profile_id, availability, reviews, application_status, resume_url,
       profiles:profile_id (
-        name, email, avatar, title, company, experience, rating, bio, verified, price, specialties, timezone
+        name, email, phone, avatar, title, company, experience, rating, bio, verified, price, specialties, timezone
       )
     `);
   if (error) throw error;
@@ -1235,6 +1339,10 @@ export async function listMentors(): Promise<Mentor[]> {
 
     const m: Mentor = {
       id: row.id,
+      user_id: row.user_id,                       // ✅ add
+      profile_id: row.profile_id,                 // ✅ add
+      application_status: (row.application_status as ApplicationStatus) ?? 'pending', // ✅ add
+
       name: p.name,
       title: p.title,
       company: p.company,
@@ -1248,12 +1356,13 @@ export async function listMentors(): Promise<Mentor[]> {
       availability: row.availability ?? 'high',
       timezone: p.timezone ?? "UTC",
       bio: p.bio ?? '',
-      // Optional fields your UI might read:
+
+      // Optional/compat
       headline: p.title ? `${p.title} @ ${p.company ?? ""}`.trim() : "",
       languages: [],
       yearsOfExperience: p.experience ?? 0,
-      packages: [],         // you can populate from mentor_packages list if needed
-      weeklySchedule: [],   // kept for compatibility
+      packages: [],
+      weeklySchedule: [],
       bufferMinutes: 15,
       timeOff: [],
       status: 'active',
@@ -1263,13 +1372,63 @@ export async function listMentors(): Promise<Mentor[]> {
   });
 }
 
+
+/** NEW: for Find Mentors — only approved & verified mentors */
+export async function listApprovedMentors(): Promise<Mentor[]> {
+  const { data, error } = await supabase
+    .from("mentors")
+    .select(`
+      id, user_id, profile_id, availability, reviews, application_status,
+      profiles:profile_id (
+        name, email, phone, avatar, title, company, experience, rating, bio, verified, specialties, timezone
+      )
+    `)
+    .eq("application_status", "approved");
+  if (error) throw error;
+
+  return (data ?? []).map((row: any) => {
+    const p = firstOrUndefined<any>(row.profiles) || {};
+    const m: Mentor = {
+      id: row.id,
+      user_id: row.user_id,                       // ✅ add
+      profile_id: row.profile_id,                 // ✅ add
+      application_status: (row.application_status as ApplicationStatus) ?? 'approved', // ✅ add
+
+      name: p.name,
+      title: p.title,
+      company: p.company,
+      avatar: p.avatar,
+      verified: !!p.verified,
+      experience: p.experience ?? 0,
+      price: 0,
+      rating: p.rating ?? 0,
+      reviews: row.reviews ?? 0,
+      specialties: p.specialties ?? [],
+      availability: row.availability ?? 'high',
+      timezone: p.timezone ?? "UTC",
+      bio: p.bio ?? '',
+      headline: p.title ? `${p.title} @ ${p.company ?? ""}`.trim() : "",
+      languages: [],
+      yearsOfExperience: p.experience ?? 0,
+      packages: [],
+      weeklySchedule: [],
+      bufferMinutes: 15,
+      timeOff: [],
+      status: 'active',
+      payoutConnected: false,
+    };
+    return m;
+  });
+}
+
+
 export async function getMentor(id: string): Promise<Mentor | null> {
   const { data, error } = await supabase
     .from("mentors")
     .select(`
-      id, user_id, profile_id, availability, reviews,
+      id, user_id, profile_id, availability, reviews, application_status, resume_url,
       profiles:profile_id (
-        name, email, avatar, title, company, experience, rating, bio, verified, price, specialties, timezone
+        name, email, phone, avatar, title, company, experience, rating, bio, verified, price, specialties, timezone
       )
     `)
     .eq("id", id)
@@ -1280,6 +1439,10 @@ export async function getMentor(id: string): Promise<Mentor | null> {
 
   const m: Mentor = {
     id: data.id,
+    user_id: data.user_id,                           // ✅ add
+    profile_id: data.profile_id,                     // ✅ add
+    application_status: (data.application_status as ApplicationStatus) ?? 'pending', // ✅ add
+
     name: p.name,
     title: p.title,
     company: p.company,
@@ -1305,9 +1468,11 @@ export async function getMentor(id: string): Promise<Mentor | null> {
   };
   return m;
 }
+
+/** Resolve the mentor row for the logged-in user (by auth.uid). */
 export async function getMyMentorId(): Promise<string | null> {
   const { data: uinfo } = await supabase.auth.getUser();
-  const uid = uinfo?.user?.id;
+  const uid = uinfo?.user?.id ?? "";
   if (!uid) return null;
 
   const { data, error } = await supabase
@@ -1317,11 +1482,9 @@ export async function getMyMentorId(): Promise<string | null> {
     .maybeSingle();
 
   if (error) return null;
-
-  const mid = data?.id ?? null;
-  if (mid) write(KEY.currentMentorId, mid); // cache for dashboard
-  return mid;
+  return data?.id ?? null;
 }
+
 export async function listUpcomingForMentor(mentorId: string) {
   const nowIso = new Date().toISOString();
 
@@ -1368,7 +1531,22 @@ export function updateMentorProfile(id: string, patch: Partial<Mentor>) {
   }
   return updated;
 }
+export function clearCurrentMentorId() {
+  try { localStorage.removeItem(MENTOR_ID_CACHE_KEY); } catch {}
+}
 
+// If you cache the current user/role anywhere, clear it here.
+// Adjust keys to whatever you actually use.
+export function clearUserCache() {
+  const keys = [
+    "aw.currentUser",
+    "currentUser",
+    "user",
+    "aw.user",
+  ];
+  try { keys.forEach(k => localStorage.removeItem(k)); } catch {}
+  try { keys.forEach(k => sessionStorage.removeItem(k)); } catch {}
+}
 /* =========================================================
    3) SLOTS — Supabase reads
    ========================================================= */
@@ -1388,6 +1566,7 @@ export async function listSlotsForMentor(mentorId: string): Promise<TimeSlot[]> 
     available: s.available,
   }));
 }
+
 
 /* =========================================================
    4) BOOKINGS — Supabase list + atomic RPC booking
@@ -1509,7 +1688,15 @@ export async function rescheduleBooking(bookingId: string, newSlotId: string, re
   if (error) throw error;
   return data; // booking id
 }
-
+export async function rescheduleBookingDb(bookingId: string, newSlotId: string, reason?: string) {
+  const { data, error } = await supabase.rpc("reschedule_booking", {
+    _booking_id: bookingId,
+    _new_slot_id: newSlotId,
+    _reason: reason ?? null,
+  });
+  if (error) throw error;
+  return data as string; // booking id
+}
 export async function cancelBooking(bookingId: string, reason?: string) {
   const { data, error } = await supabase.rpc("cancel_booking", {
     _booking_id: bookingId,
@@ -1518,10 +1705,118 @@ export async function cancelBooking(bookingId: string, reason?: string) {
   if (error) throw error;
   return data; // booking id
 }
+// Mentor actions
+export async function confirmBookingDb(bookingId: string) {
+  const { data, error } = await supabase.rpc("confirm_booking", { _booking_id: bookingId });
+  if (error) throw error;
+  return data as string;
+}
+
+export async function declineBookingDb(bookingId: string, reason?: string) {
+  const { data, error } = await supabase.rpc("decline_booking", {
+    _booking_id: bookingId,
+    _reason: reason ?? null,
+  });
+  if (error) throw error;
+  return data as string;
+}
+
 
 /* =========================================================
    6) Admin / Contact — NOW DB-backed (Phase 2)
    ========================================================= */
+
+/** NEW: list mentor applications for Admin (optionally filter by status) */
+export async function listMentorApplicants(status?: ApplicationStatus) {
+  let q = supabase
+    .from("mentors")
+    .select(`
+      id,
+      user_id,
+      profile_id,
+      resume_url,
+      application_status,
+      created_at,
+      profiles:profile_id (
+        id, name, email, phone, role, verified, specialties, experience
+      )
+    `)
+    .order("created_at", { ascending: false });
+
+  if (status) q = q.eq("application_status", status);
+  const { data, error } = await q;
+  if (error) throw error;
+  return data;
+}
+
+/** FIND a profile by email (admin add-mentor flow) */
+export async function findProfileByEmail(email: string) {
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("id, user_id, name, email, phone, role, verified")
+    .ilike("email", email)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+/** SET a profile's role (admin add-mentor flow) */
+export async function setProfileRole(profileId: string, role: "mentor" | "client" | "admin") {
+  const { error } = await supabase.from("profiles").update({ role }).eq("id", profileId);
+  if (error) throw error;
+}
+
+/** Admin upsert mentor (optionally approve immediately) */
+export async function adminCreateOrUpdateMentor({
+  userId,
+  profileId,
+  resumePath,
+  specialties,
+  experience,
+  status,
+}: {
+  userId: string;
+  profileId: string;
+  resumePath: string | null;
+  specialties?: string[] | string | null;
+  experience?: number | null;
+  status: ApplicationStatus; // 'approved' | 'pending' | 'rejected'
+}) {
+  // upsert profiles.experience/specialties
+  const { error: profErr } = await supabase
+    .from("profiles")
+    .update({
+      specialties: Array.isArray(specialties) ? specialties : specialties ?? null,
+      experience: experience ?? null,
+    })
+    .eq("id", profileId);
+  if (profErr) throw profErr;
+
+  // upsert mentor row
+  const { data: existing, error: selErr } = await supabase
+    .from("mentors")
+    .select("id")
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (selErr) throw selErr;
+
+  const payload = {
+    user_id: userId,
+    profile_id: profileId,
+    resume_url: resumePath,
+    application_status: status,
+  };
+
+  if (existing?.id) {
+    const { error } = await supabase.from("mentors").update(payload).eq("id", existing.id);
+    if (error) throw error;
+    return existing.id;
+  } else {
+    const { data, error } = await supabase.from("mentors").insert(payload).select("id").single();
+    if (error) throw error;
+    return data.id as string;
+  }
+}
 
 // Admin stats from DB
 export async function getAdminStats(): Promise<AdminStats> {
@@ -1541,18 +1836,16 @@ export async function getAdminStats(): Promise<AdminStats> {
 
   const totalBookings = bookingsData?.length ?? 0;
   const upcomingSessions = (bookingsData ?? []).filter(b => {
-  const ts = firstOrUndefined<any>(b.time_slots);
-  const start = ts?.start_iso ? new Date(ts.start_iso) : null;
-  return start && start > new Date() && b.status !== 'cancelled';
-}).length;
+    const ts = firstOrUndefined<any>(b.time_slots);
+    const start = ts?.start_iso ? new Date(ts.start_iso) : null;
+    return start && start > new Date() && b.status !== 'cancelled';
+  }).length;
 
-
-  // pending mentors approximated via profiles.verified=false & role='mentor'
+  // pending mentors via mentors.application_status = 'pending'
   const { count: pendingMentors } = await supabase
-    .from("profiles")
+    .from("mentors")
     .select("id", { count: "exact" })
-    .eq("role", "mentor")
-    .eq("verified", false);
+    .eq("application_status", "pending");
 
   return {
     totalMentors: mentorsCount ?? 0,
@@ -1677,7 +1970,7 @@ export async function getEarningsForMentor(mentorId: string) {
     .single();
   if (mErr) throw mErr;
   const prof = firstOrUndefined<any>(mentor?.profiles);
-const price = prof?.price ?? 0;
+  const price = prof?.price ?? 0;
 
   // confirmed bookings and times
   const { data: bookings, error: bErr } = await supabase
@@ -1696,8 +1989,7 @@ const price = prof?.price ?? 0;
   const monthToDate = confirmed
     .filter(b => {
       const ts = firstOrUndefined<any>(b.time_slots);
-const s = ts?.start_iso ? new Date(ts.start_iso) : null;
-
+      const s = ts?.start_iso ? new Date(ts.start_iso) : null;
       return s && s >= startOfMonth && s <= now;
     }).length * price;
 
@@ -1708,7 +2000,6 @@ const s = ts?.start_iso ? new Date(ts.start_iso) : null;
   const transactions = confirmed.slice(-10).map(b => ({
     id: b.id,
     date: (firstOrUndefined<any>(b.time_slots)?.start_iso) ?? b.created_at,
-
     client: "", // optionally join client profile
     amount: price,
     status: "pending" as "pending" | "paid",
@@ -1728,27 +2019,55 @@ async function getProfileIdForMentor(mentorId: string): Promise<string | null> {
   return data?.profile_id ?? null;
 }
 
+/** UPDATED: Approve also sets mentors.application_status = 'approved' */
 export async function approveMentor(mentorId: string) {
   const profileId = await getProfileIdForMentor(mentorId);
   if (!profileId) throw new Error("Profile not found for mentor");
-  const { error } = await supabase.rpc("admin_set_verified", { _profile_id: profileId, _verified: true });
-  if (error) throw error;
+
+  // flip verified
+  const { error: vErr } = await supabase.rpc("admin_set_verified", { _profile_id: profileId, _verified: true });
+  if (vErr) throw vErr;
+
+  // set application approved
+  const { error: aErr } = await supabase
+    .from("mentors")
+    .update({ application_status: 'approved' as ApplicationStatus })
+    .eq("id", mentorId);
+  if (aErr) throw aErr;
+
   return true;
 }
+
+/** UPDATED: Reject also sets mentors.application_status = 'rejected' */
 export async function rejectMentor(mentorId: string) {
   const profileId = await getProfileIdForMentor(mentorId);
   if (!profileId) throw new Error("Profile not found for mentor");
-  const { error } = await supabase.rpc("admin_set_verified", { _profile_id: profileId, _verified: false });
-  if (error) throw error;
+
+  const { error: vErr } = await supabase.rpc("admin_set_verified", { _profile_id: profileId, _verified: false });
+  if (vErr) throw vErr;
+
+  const { error: aErr } = await supabase
+    .from("mentors")
+    .update({ application_status: 'rejected' as ApplicationStatus })
+    .eq("id", mentorId);
+  if (aErr) throw aErr;
+
   return true;
 }
 export async function markMentorPending(mentorId: string) {
-  // If you introduce a real "pending" state, add profiles.status and update it here.
-  // For now, treat pending as verified=false.
+  // Treat pending as verified=false + mentors.application_status='pending'
   const profileId = await getProfileIdForMentor(mentorId);
   if (!profileId) throw new Error("Profile not found for mentor");
-  const { error } = await supabase.rpc("admin_set_verified", { _profile_id: profileId, _verified: false });
-  if (error) throw error;
+
+  const { error: vErr } = await supabase.rpc("admin_set_verified", { _profile_id: profileId, _verified: false });
+  if (vErr) throw vErr;
+
+  const { error: aErr } = await supabase
+    .from("mentors")
+    .update({ application_status: 'pending' as ApplicationStatus })
+    .eq("id", mentorId);
+  if (aErr) throw aErr;
+
   return true;
 }
 // Create slots for specific dates (selected on a calendar)
@@ -1886,4 +2205,44 @@ function normalizeWeekly(weekly: any[]): WeeklySlot[] {
     return { id, weekday, start, end, active };
   });
 }
+/**
+ * Claim an approved mentor application for the current user (by matching email),
+ * link it to their account, and mark their profile as verified.
+ * Returns:
+ *   { claimed: true }  if a row was linked/verified,
+ *   { claimed: false } if nothing to claim.
+ */
+export async function claimApprovedMentorForCurrentUser() {
+  const { data: auth } = await supabase.auth.getUser();
+  const uid = auth?.user?.id;
+  if (!uid) return;
+
+  const { data: prof } = await supabase
+    .from("profiles")
+    .select("id, email")
+    .eq("user_id", uid)
+    .maybeSingle();
+  if (!prof) return;
+
+  // find an approved row for this person (by user_id, profile_id, or email)
+  const { data: row, error } = await supabase
+    .from("mentors")
+    .select("id, user_id, profile_id, application_status")
+    .or(`user_id.eq.${uid},profile_id.eq.${prof.id},applicant_email.eq.${prof.email}`)
+    .eq("application_status", "approved")
+    .maybeSingle();
+  if (error || !row) return;
+
+  // attach it if needed
+  if (row.user_id !== uid || row.profile_id !== prof.id) {
+    await supabase.from("mentors").update({
+      user_id: uid,
+      profile_id: prof.id
+    }).eq("id", row.id);
+  }
+
+  // ensure verified
+  await supabase.from("profiles").update({ verified: true, role: "mentor" }).eq("id", prof.id);
+}
+
 

@@ -431,7 +431,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
-// ✅ NEW: use supabase directly to read pending mentor profiles
+// ✅ use supabase directly
 import { supabase } from "@/lib/supabase";
 
 const AdminDashboard = () => {
@@ -441,20 +441,24 @@ const AdminDashboard = () => {
   const [mentors, setMentors] = useState<Mentor[]>([]);
   const [bookings, setBookings] = useState<Booking[]>([]);
 
-  // ✅ NEW: pending mentor PROFILES (role='mentor' AND verified=false)
-  const [pendingProfiles, setPendingProfiles] = useState<any[]>([]);
+  // ✅ NEW: pending mentor APPLICATIONS (from mentors table joined with profiles)
+  const [pendingApps, setPendingApps] = useState<any[]>([]);
 
   // Eye dialog state
   const [viewOpen, setViewOpen] = useState(false);
   const [viewMentor, setViewMentor] = useState<Mentor | null>(null);
 
-  // Add-mentor dialog state (kept same)
+  // Add-mentor dialog state (extended)
   const [addOpen, setAddOpen] = useState(false);
   const [addName, setAddName] = useState("");
   const [addTitle, setAddTitle] = useState("");
   const [addExperience, setAddExperience] = useState<number | string>("");
   const [addSpecialties, setAddSpecialties] = useState("");
   const [addAvatar, setAddAvatar] = useState("");
+  // ✅ NEW fields
+  const [addEmail, setAddEmail] = useState("");
+  const [addPhone, setAddPhone] = useState("");
+  const [addResumeFile, setAddResumeFile] = useState<File | null>(null);
 
   useEffect(() => {
     if (!user || user.role !== "admin") {
@@ -472,16 +476,24 @@ const AdminDashboard = () => {
         setMentors(ms);
         setBookings(bs);
 
-        // ✅ fetch pending mentor PROFILES (admins can read via policy we added)
-        const { data: pend, error: pendErr } = await supabase
-          .from("profiles")
-          .select("id, user_id, name, email, avatar, title, company, experience, rating, bio, specialties, verified, role")
-          .eq("role", "mentor")
-          .eq("verified", false)
+        // ✅ fetch pending mentor applications from mentors table (join profiles)
+        const { data: apps, error: appsErr } = await supabase
+          .from("mentors")
+          .select(`
+            id,
+            profile_id,
+            resume_url,
+            application_status,
+            created_at,
+            profiles:profile_id (
+              id, user_id, name, email, phone, avatar, title, company, experience, rating, bio, specialties, verified, role, timezone
+            )
+          `)
+          .eq("application_status", "pending")
           .order("created_at", { ascending: false });
 
-        if (pendErr) throw pendErr;
-        setPendingProfiles(pend ?? []);
+        if (appsErr) throw appsErr;
+        setPendingApps(apps ?? []);
       } catch (e: any) {
         toast({
           title: "Failed to load admin data",
@@ -512,7 +524,7 @@ const AdminDashboard = () => {
     [mentors]
   );
 
-  // ✅ refresh now also re-fetches pending PROFILES
+  // ✅ refresh also re-fetches pending mentor applications
   const refresh = async () => {
     try {
       const [ms, s, bs] = await Promise.all([listMentors(), getAdminStats(), listBookings()]);
@@ -520,15 +532,23 @@ const AdminDashboard = () => {
       setStats(s);
       setBookings(bs);
 
-      const { data: pend, error: pendErr } = await supabase
-        .from("profiles")
-        .select("id, user_id, name, email, avatar, title, company, experience, rating, bio, specialties, verified, role")
-        .eq("role", "mentor")
-        .eq("verified", false)
+      const { data: apps, error: appsErr } = await supabase
+        .from("mentors")
+        .select(`
+          id,
+          profile_id,
+          resume_url,
+          application_status,
+          created_at,
+          profiles:profile_id (
+            id, user_id, name, email, phone, avatar, title, company, experience, rating, bio, specialties, verified, role, timezone
+          )
+        `)
+        .eq("application_status", "pending")
         .order("created_at", { ascending: false });
 
-      if (pendErr) throw pendErr;
-      setPendingProfiles(pend ?? []);
+      if (appsErr) throw appsErr;
+      setPendingApps(apps ?? []);
     } catch (e: any) {
       toast({
         title: "Refresh failed",
@@ -538,7 +558,7 @@ const AdminDashboard = () => {
     }
   };
 
-  // Existing mentor approve (by mentorId) – used only where mentors list is shown as approved
+  // Existing mentor approve by mentorId (kept)
   const handleApproveMentor = async (mentorId: string) => {
     try {
       await approveMentor(mentorId);
@@ -565,78 +585,168 @@ const AdminDashboard = () => {
     setViewOpen(true);
   };
 
-  // ✅ NEW: Approve/Reject by PROFILE (pending list is profiles)
-  const handleApproveProfile = async (profileId: string) => {
+  // ✅ Approve/Reject by APPLICATION (has mentorId + profileId)
+  const handleApproveApplication = async (app: any) => {
     try {
-      // flip verified=true via secure RPC
-      const { error } = await supabase.rpc("admin_set_verified", { _profile_id: profileId, _verified: true });
-      if (error) throw error;
+      // 1) if it's a self-signup (has profile/user), verify profile now
+      if (app.profile_id) {
+        const { error: rpcErr } = await supabase.rpc("admin_set_verified", {
+          _profile_id: app.profile_id,
+          _verified: true,
+        });
+        if (rpcErr) throw rpcErr;
+      }
+
+      // 2) mark application approved + stamp approved_at
+      const { error: upErr } = await supabase
+        .from("mentors")
+        .update({ application_status: "approved", approved_at: new Date().toISOString() })
+        .eq("id", app.id);
+      if (upErr) throw upErr;
+
       await refresh();
-      toast({ title: "Mentor Approved", description: "Profile verified successfully." });
+      toast({ title: "Mentor Approved", description: "Mentor is now visible in Find Mentors." });
     } catch (e: any) {
       toast({ title: "Approve failed", description: e?.message ?? "Please try again.", variant: "destructive" });
     }
   };
 
-  const handleRejectProfile = async (profileId: string) => {
+  const handleRejectApplication = async (app: any) => {
     try {
-      const { error } = await supabase.rpc("admin_set_verified", { _profile_id: profileId, _verified: false });
+      const { error } = await supabase
+        .from("mentors")
+        .update({ application_status: "rejected" })
+        .eq("id", app.id);
       if (error) throw error;
+
       await refresh();
-      toast({ title: "Mentor Rejected", description: "Profile set to not verified." });
+      toast({ title: "Mentor Rejected", description: "Application set to rejected." });
     } catch (e: any) {
       toast({ title: "Reject failed", description: e?.message ?? "Please try again.", variant: "destructive" });
     }
   };
 
-  // ADD NEW MENTOR (kept same – local pending seed)
-  const handleAddSubmit = (e: React.FormEvent) => {
+  // ✅ view resume (signed URL)
+  const handleViewResume = async (resumePath: string) => {
+    try {
+      const { data, error } = await supabase.storage.from("resumes").createSignedUrl(resumePath, 120);
+      if (error) throw error;
+      if (data?.signedUrl) window.open(data.signedUrl, "_blank", "noopener,noreferrer");
+    } catch (e: any) {
+      toast({ title: "Unable to open resume", description: e?.message ?? "Try again.", variant: "destructive" });
+    }
+  };
+
+  // ADD NEW MENTOR (updated to write to Supabase)
+  const handleAddSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const id = "m_" + Math.random().toString(36).slice(2, 10);
-    const specialties = addSpecialties
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
+    try {
+      if (!addEmail) {
+        toast({ title: "Email required", description: "Enter the mentor's email.", variant: "destructive" });
+        return;
+      }
 
-    const newMentor: Mentor = {
-      id,
-      name: addName.trim() || "New Mentor",
-      title: addTitle.trim() || "Senior Specialist",
-      company: "",
-      avatar: addAvatar.trim(),
-      verified: false,
-      experience: Number(addExperience) || 0,
-      price: 100,
-      rating: 0,
-      reviews: 0,
-      specialties,
-      availability: "medium" as any,
-      timezone: "UTC",
-      bio: "",
-      headline: "",
-      languages: ["English"],
-      yearsOfExperience: Number(addExperience) || 0,
-      packages: [
-        { id: "pkg30", label: "30 min", minutes: 30, price: 50, currency: "USD", active: true } as any,
-      ] as any,
-      weeklySchedule: [] as any,
-      bufferMinutes: 15 as any,
-      timeOff: [] as any,
-      status: "pending" as any,
-      payoutConnected: false as any,
-    };
+      // 1) Find profile by email (user must have signed up)
+      const { data: prof, error: profErr } = await supabase
+        .from("profiles")
+        .select("id, user_id")
+        .ilike("email", addEmail)
+        .maybeSingle();
+      if (profErr) throw profErr;
+      if (!prof) {
+        toast({
+          title: "No user found",
+          description: "Ask the mentor to sign up first using this email.",
+          variant: "destructive",
+        });
+        return;
+      }
 
-    upsertMentorProfile(newMentor);
-    setMentors((prev) => [newMentor, ...prev]);
+      // 2) Update profile details + role=mentor
+      const { error: upProfErr } = await supabase
+        .from("profiles")
+        .update({ name: addName || null, phone: addPhone || null, role: "mentor" })
+        .eq("id", prof.id);
+      if (upProfErr) throw upProfErr;
 
-    setAddOpen(false);
-    setAddName("");
-    setAddTitle("");
-    setAddExperience("");
-    setAddSpecialties("");
-    setAddAvatar("");
+      // 3) Upload resume (optional) — **key must NOT include 'resumes/' prefix**
+      let resumePath: string | null = null;
+      if (addResumeFile) {
+        const ext = addResumeFile.name.split(".").pop()?.toLowerCase() || "pdf";
+        const key = `${prof.user_id}/${Date.now()}-resume.${ext}`; // ✅ correct path
+        const { error: upErr } = await supabase.storage
+          .from("resumes")
+          .upload(key, addResumeFile, {
+            cacheControl: "3600",
+            upsert: false,
+            contentType: addResumeFile.type || "application/pdf",
+          });
+        if (upErr) throw upErr;
+        resumePath = key;
+      }
 
-    toast({ title: "Mentor Added", description: "Mentor submitted as pending." });
+      // 4) Upsert mentor row and set approved (+ approved_at)
+      const { data: existing, error: selErr } = await supabase
+        .from("mentors")
+        .select("id")
+        .eq("user_id", prof.user_id)
+        .maybeSingle();
+      if (selErr) throw selErr;
+
+      const mentorPayload: any = {
+        user_id: prof.user_id,
+        profile_id: prof.id,
+        resume_url: resumePath,
+        application_status: "approved",
+        approved_at: new Date().toISOString(), // ✅ stamp
+      };
+
+      if (existing?.id) {
+        const { error: upErr2 } = await supabase.from("mentors").update(mentorPayload).eq("id", existing.id);
+        if (upErr2) throw upErr2;
+      } else {
+        const { error: insErr } = await supabase.from("mentors").insert(mentorPayload);
+        if (insErr) throw insErr;
+      }
+
+      // 5) Save expertise into profile
+      const specialArr = addSpecialties
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const { error: profExpErr } = await supabase
+        .from("profiles")
+        .update({
+          title: addTitle || null,
+          experience: Number(addExperience) || 0,
+          specialties: specialArr.length ? specialArr : null,
+        })
+        .eq("id", prof.id);
+      if (profExpErr) throw profExpErr;
+
+      // 6) Verify profile
+      const { error: verifyErr } = await supabase.rpc("admin_set_verified", {
+        _profile_id: prof.id,
+        _verified: true,
+      });
+      if (verifyErr) throw verifyErr;
+
+      await refresh();
+
+      setAddOpen(false);
+      setAddName("");
+      setAddTitle("");
+      setAddExperience("");
+      setAddSpecialties("");
+      setAddAvatar("");
+      setAddEmail("");
+      setAddPhone("");
+      setAddResumeFile(null);
+
+      toast({ title: "Mentor added", description: "Mentor is now approved and visible in Find Mentors." });
+    } catch (e: any) {
+      toast({ title: "Add failed", description: e?.message ?? "Please try again.", variant: "destructive" });
+    }
   };
 
   if (!user || user.role !== "admin") return null;
@@ -691,7 +801,7 @@ const AdminDashboard = () => {
                 <DropdownMenuItem
                   onClick={() => {
                     logout();
-                    navigate("/login");
+                    navigate("/");
                   }}
                 >
                   <LogOut className="mr-2 h-4 w-4" />
@@ -773,7 +883,7 @@ const AdminDashboard = () => {
                 <TabsTrigger value="approved">Approved Mentors</TabsTrigger>
               </TabsList>
 
-              {/* PENDING (now renders from profiles) */}
+              {/* PENDING (applications from mentors join profiles) */}
               <TabsContent value="pending">
                 <Card>
                   <CardHeader>
@@ -786,39 +896,55 @@ const AdminDashboard = () => {
                           <TableHead>Mentor</TableHead>
                           <TableHead>Experience</TableHead>
                           <TableHead>Specialties</TableHead>
+                          <TableHead>Resume</TableHead>
                           <TableHead>Status</TableHead>
                           <TableHead>Actions</TableHead>
                         </TableRow>
                       </TableHeader>
                       <TableBody>
-                        {pendingProfiles.length === 0 && (
+                        {pendingApps.length === 0 && (
                           <TableRow>
-                            <TableCell colSpan={5} className="text-sm text-muted-foreground">
+                            <TableCell colSpan={6} className="text-sm text-muted-foreground">
                               No pending applications.
                             </TableCell>
                           </TableRow>
                         )}
-                        {pendingProfiles.map((p: any) => (
-                          <TableRow key={p.id}>
+                        {pendingApps.map((app: any) => (
+                          <TableRow key={app.id}>
                             <TableCell className="flex items-center gap-3">
                               <Avatar>
-                                <AvatarImage src={p.avatar} />
-                                <AvatarFallback>{(p.name || "M").charAt(0)}</AvatarFallback>
+                                <AvatarImage src={app.profiles?.avatar} />
+                                <AvatarFallback>{(app.profiles?.name || "M").charAt(0)}</AvatarFallback>
                               </Avatar>
                               <div>
-                                <div className="font-medium">{p.name}</div>
-                                <div className="text-sm text-muted-foreground">{p.title}</div>
+                                <div className="font-medium">{app.profiles?.name}</div>
+                                <div className="text-sm text-muted-foreground">
+                                  {app.profiles?.title} • {app.profiles?.email}
+                                </div>
                               </div>
                             </TableCell>
-                            <TableCell>{p.experience ?? 0} years</TableCell>
+                            <TableCell>{app.profiles?.experience ?? 0} years</TableCell>
                             <TableCell>
                               <div className="flex flex-wrap gap-1">
-                                {(Array.isArray(p.specialties) ? p.specialties : []).slice(0, 2).map((specialty: string) => (
+                                {(Array.isArray(app.profiles?.specialties) ? app.profiles?.specialties : []).slice(0, 2).map((specialty: string) => (
                                   <Badge key={specialty} variant="secondary" className="text-xs">
                                     {specialty}
                                   </Badge>
                                 ))}
                               </div>
+                            </TableCell>
+                            <TableCell>
+                              {app.resume_url ? (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => handleViewResume(app.resume_url)}
+                                >
+                                  View Resume
+                                </Button>
+                              ) : (
+                                <span className="text-xs text-muted-foreground">—</span>
+                              )}
                             </TableCell>
                             <TableCell>
                               <Badge variant="outline" className="text-yellow-600">
@@ -827,46 +953,18 @@ const AdminDashboard = () => {
                             </TableCell>
                             <TableCell>
                               <div className="flex gap-2">
-                                {/* For pending, view just shows profile basics */}
-                                <Button size="sm" variant="outline" onClick={() => {
-                                  setViewMentor({
-                                    // map minimal profile fields to Mentor-like view
-                                    id: p.id,
-                                    name: p.name,
-                                    title: p.title,
-                                    company: p.company,
-                                    avatar: p.avatar,
-                                    verified: false,
-                                    experience: p.experience ?? 0,
-                                    price: p.price ?? 0,
-                                    rating: p.rating ?? 0,
-                                    reviews: 0,
-                                    specialties: Array.isArray(p.specialties) ? p.specialties : [],
-                                    availability: "medium" as any,
-                                    timezone: p.timezone ?? "UTC",
-                                    bio: p.bio ?? "",
-                                    headline: p.title ? `${p.title}${p.company ? ` @ ${p.company}` : ""}` : "",
-                                    languages: [],
-                                    yearsOfExperience: p.experience ?? 0,
-                                    packages: [],
-                                    weeklySchedule: [],
-                                    bufferMinutes: 15 as any,
-                                    timeOff: [],
-                                    status: "pending" as any,
-                                    payoutConnected: false as any,
-                                  } as any);
-                                  setViewOpen(true);
-                                }}>
-                                  <Eye className="h-4 w-4" />
-                                </Button>
                                 <Button
                                   size="sm"
-                                  onClick={() => handleApproveProfile(p.id)}
+                                  onClick={() => handleApproveApplication(app)}
                                   className="bg-green-600 hover:bg-green-700"
                                 >
                                   <Check className="h-4 w-4" />
                                 </Button>
-                                <Button size="sm" variant="destructive" onClick={() => handleRejectProfile(p.id)}>
+                                <Button
+                                  size="sm"
+                                  variant="destructive"
+                                  onClick={() => handleRejectApplication(app)}
+                                >
                                   <X className="h-4 w-4" />
                                 </Button>
                               </div>
@@ -950,7 +1048,7 @@ const AdminDashboard = () => {
                   </TableHeader>
                   <TableBody>
                     {bookings.map((booking) => {
-                      const mentor = mentors.find((m) => m.id === booking.mentorId);
+                      const mentor = mentors.find((m) => m.id === (booking as any).mentorId);
                       const cls = statusClasses[String((booking as any).status)] ?? statusClasses.default;
                       const clientLabel = (booking as any).menteeName ?? (booking as any).clientId ?? "Unknown";
                       return (
@@ -1085,19 +1183,37 @@ const AdminDashboard = () => {
         </DialogContent>
       </Dialog>
 
-      {/* Add New Mentor Dialog (unchanged) */}
+      {/* Add New Mentor Dialog (updated to collect email/phone/resume) */}
       <Dialog open={addOpen} onOpenChange={setAddOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Add New Mentor (Pending)</DialogTitle>
+            <DialogTitle>Add New Mentor (Approve Now)</DialogTitle>
           </DialogHeader>
 
           <form onSubmit={handleAddSubmit} className="space-y-4">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {/* REQUIRED NEW FIELDS */}
+              <div className="md:col-span-2">
+                <Label htmlFor="email">Email</Label>
+                <Input
+                  id="email"
+                  type="email"
+                  value={addEmail}
+                  onChange={(e) => setAddEmail(e.target.value)}
+                  placeholder="mentor@example.com"
+                  required
+                />
+              </div>
               <div>
                 <Label htmlFor="name">Name</Label>
                 <Input id="name" value={addName} onChange={(e) => setAddName(e.target.value)} required />
               </div>
+              <div>
+                <Label htmlFor="phone">Mobile</Label>
+                <Input id="phone" value={addPhone} onChange={(e) => setAddPhone(e.target.value)} placeholder="+91 ..." />
+              </div>
+
+              {/* Expertise */}
               <div>
                 <Label htmlFor="title">Title</Label>
                 <Input id="title" value={addTitle} onChange={(e) => setAddTitle(e.target.value)} required />
@@ -1113,15 +1229,17 @@ const AdminDashboard = () => {
                   required
                 />
               </div>
-              <div>
-                <Label htmlFor="specialties">Specialties (comma separated)</Label>
+              <div className="md:col-span-2">
+                <Label htmlFor="specialties">Expertise (comma separated)</Label>
                 <Input
                   id="specialties"
                   value={addSpecialties}
                   onChange={(e) => setAddSpecialties(e.target.value)}
-                  placeholder="System Design, PM Interviews"
+                  placeholder="React, Supabase, Tailwind"
                 />
               </div>
+
+              {/* Optional visuals */}
               <div className="md:col-span-2">
                 <Label htmlFor="avatar">Avatar URL (optional)</Label>
                 <Input
@@ -1131,13 +1249,24 @@ const AdminDashboard = () => {
                   placeholder="https://..."
                 />
               </div>
+
+              {/* Resume */}
+              <div className="md:col-span-2">
+                <Label htmlFor="resume">Resume (PDF, optional)</Label>
+                <Input
+                  id="resume"
+                  type="file"
+                  accept=".pdf,application/pdf"
+                  onChange={(e) => setAddResumeFile(e.target.files?.[0] ?? null)}
+                />
+              </div>
             </div>
 
             <DialogFooter className="gap-2">
               <Button type="button" variant="outline" onClick={() => setAddOpen(false)}>
                 Cancel
               </Button>
-              <Button type="submit">Add to Pending</Button>
+              <Button type="submit">Save & Approve</Button>
             </DialogFooter>
           </form>
         </DialogContent>
@@ -1147,5 +1276,6 @@ const AdminDashboard = () => {
 };
 
 export default AdminDashboard;
+
 
 
