@@ -1,5 +1,5 @@
-// src/components/auth/MentorGate.tsx
 import React, { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { supabase } from "@/lib/supabase";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -7,52 +7,77 @@ import { Button } from "@/components/ui/button";
 type GateState = "checking" | "approved" | "pending" | "none" | "error";
 
 export default function MentorGate({ children }: { children: React.ReactNode }) {
+  const navigate = useNavigate();
   const [state, setState] = useState<GateState>("checking");
   const [message, setMessage] = useState<string>("");
+
+  async function getCurrentUserId(): Promise<string | null> {
+    // Fast path: session is read from memory/storage without network
+    const { data: sess } = await supabase.auth.getSession();
+    const fastUserId = sess?.session?.user?.id ?? null;
+    if (fastUserId) return fastUserId;
+
+    // Fallback (rare): may do a network call
+    const { data: auth } = await supabase.auth.getUser();
+    return auth?.user?.id ?? null;
+  }
 
   async function checkStatus() {
     try {
       setState("checking");
 
       // 1) Auth user
-      const { data: auth } = await supabase.auth.getUser();
-      const user = auth?.user;
-      if (!user?.id) {
-        setMessage("Please sign in to access the mentor dashboard.");
+      const userId = await getCurrentUserId();
+      if (!userId) {
+        // IMPORTANT: leave "checking" state to avoid blank screen while we redirect
         setState("none");
+        // ⬅️ go to HOME, not /login
+        navigate("/", { replace: true });
         return;
       }
 
-      // 2) Profile (for verified flag)
+      // 2) Load profile in a single query (handles both legacy rows and new rows)
       const { data: profile, error: profErr } = await supabase
         .from("profiles")
-        .select("id, verified")
-        .eq("id", user.id)
+        .select("id, verified, email")
+        .or(`user_id.eq.${userId},id.eq.${userId}`)
         .maybeSingle();
       if (profErr) throw profErr;
 
-      // 3) Mentor row (for application_status)
+      const profileId = profile?.id ?? null;
+
+      // 3) Find mentor row for THIS user/profile (single call)
       const { data: mentor, error: mentorErr } = await supabase
         .from("mentors")
-        .select("application_status")
-        .eq("user_id", user.id)
+        .select("id, application_status, user_id, profile_id")
+        .or(
+          [
+            `user_id.eq.${userId}`,
+            profileId ? `profile_id.eq.${profileId}` : "",
+          ]
+            .filter(Boolean)
+            .join(",")
+        )
         .maybeSingle();
       if (mentorErr) throw mentorErr;
 
+      // No mentor row yet -> hasn't applied
       if (!mentor) {
-        // No application yet
         setMessage("You haven’t started a mentor application yet.");
         setState("none");
         return;
       }
 
-      const approved = mentor.application_status === "approved" && profile?.verified === true;
-      if (approved) {
+      // 4) Approved -> just let them in (NO writes here)
+      if (mentor.application_status === "approved") {
+        setMessage("");
         setState("approved");
-      } else {
-        setMessage("Your mentor application is pending admin approval.");
-        setState("pending");
+        return;
       }
+
+      // 5) Not approved yet
+      setMessage("Your mentor application is pending admin approval.");
+      setState("pending");
     } catch (e: any) {
       setMessage(e?.message ?? "Something went wrong while checking your status.");
       setState("error");
@@ -61,11 +86,27 @@ export default function MentorGate({ children }: { children: React.ReactNode }) 
 
   useEffect(() => {
     checkStatus();
+
+    // Re-check on auth changes; use session from callback to decide fast
+    const { data: sub } = supabase.auth.onAuthStateChange((_evt, session) => {
+      const uid = session?.user?.id ?? null;
+      if (!uid) {
+        // signed out -> leave checking state and go home
+        setState("none");
+        navigate("/", { replace: true });
+        return;
+      }
+      // signed in -> re-run gate check
+      checkStatus();
+    });
+
+    return () => sub.subscription.unsubscribe();
   }, []);
+
+  if (state === "checking") return null; // no flash
 
   if (state === "approved") return <>{children}</>;
 
-  // Friendly holding state
   return (
     <div className="max-w-xl mx-auto p-4">
       <Card>
@@ -73,8 +114,7 @@ export default function MentorGate({ children }: { children: React.ReactNode }) 
           <CardTitle>Mentor Access</CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
-          {state === "checking" && <p className="text-muted-foreground">Checking your mentor status…</p>}
-          {state !== "checking" && <p className="text-muted-foreground">{message}</p>}
+          <p className="text-muted-foreground">{message}</p>
 
           <div className="flex gap-2 pt-2">
             {state === "none" && (
@@ -82,9 +122,15 @@ export default function MentorGate({ children }: { children: React.ReactNode }) 
                 <a href="/become-mentor">Apply to become a mentor</a>
               </Button>
             )}
-            <Button variant="outline" onClick={checkStatus}>Refresh status</Button>
-            <Button variant="ghost" asChild>
-              <a href="/">Go home</a>
+
+            {(state === "pending" || state === "none" || state === "error") && (
+              <Button variant="outline" onClick={checkStatus}>
+                Refresh status
+              </Button>
+            )}
+
+            <Button variant="ghost" onClick={() => navigate("/")}>
+              Go home
             </Button>
           </div>
         </CardContent>

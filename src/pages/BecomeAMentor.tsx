@@ -302,6 +302,7 @@
 // src/pages/BecomeAMentor.tsx
 // src/pages/BecomeAMentor.tsx// src/pages/BecomeAMentor.tsx
 // src/pages/BecomeAMentor.tsx
+// src/pages/BecomeAMentor.tsx
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
@@ -380,30 +381,57 @@ export default function BecomeAMentor() {
 
   const [submitting, setSubmitting] = useState(false);
 
-  // ------- helper: ensure a profiles row exists (avoids mentors.profile_id FK errors)
-  async function ensureProfileExists(
-    pid: string,
+  // ------- helper: reuse existing profile by user_id (avoid duplicate user_id), insert only if missing
+  async function ensureProfile(
     uid: string,
+    pid: string,
     base: { name: string; email: string; phone: string }
-  ) {
-    const { data: existing, error: selErr } = await supabase
+  ): Promise<string> {
+    // Prefer existing row by user_id (unique)
+    const { data: byUser, error: e1 } = await supabase
       .from("profiles")
       .select("id")
-      .eq("id", pid)
+      .eq("user_id", uid)
       .maybeSingle();
-    if (selErr) throw selErr;
+    if (e1) throw e1;
 
-    if (!existing) {
-      const { error: insErr } = await supabase.from("profiles").insert({
-        id: pid,
-        user_id: uid,
+    let resolvedId = byUser?.id ?? (pid || uid);
+
+    // If none by user_id, check by id; insert only if still missing
+    if (!byUser) {
+      const { data: byId, error: e2 } = await supabase
+        .from("profiles")
+        .select("id")
+        .eq("id", resolvedId)
+        .maybeSingle();
+      if (e2) throw e2;
+
+      if (!byId) {
+        const { error: insErr } = await supabase.from("profiles").insert({
+          id: resolvedId,
+          user_id: uid,
+          name: base.name || null,
+          email: base.email || null,
+          phone: base.phone || null,
+          role: "mentor",
+        });
+        if (insErr) throw insErr;
+      }
+    }
+
+    // Normalize/update fields on the resolved row
+    const { error: upErr } = await supabase
+      .from("profiles")
+      .update({
         name: base.name || null,
         email: base.email || null,
         phone: base.phone || null,
         role: "mentor",
-      });
-      if (insErr) throw insErr;
-    }
+      })
+      .eq("id", resolvedId);
+    if (upErr) throw upErr;
+
+    return resolvedId;
   }
   // -------
 
@@ -426,7 +454,7 @@ export default function BecomeAMentor() {
         const uid = authUser.id;
         setUserId(uid);
 
-        // profiles.id commonly equals auth uid; fetch to prefill
+        // Prefill from profiles (id often equals auth uid)
         const { data: prof, error: profErr } = await supabase
           .from("profiles")
           .select("id, name, email, phone, bio, avatar, specialties, experience")
@@ -437,7 +465,6 @@ export default function BecomeAMentor() {
         const pid = prof?.id ?? uid;
         setProfileId(pid);
 
-        // Prefill step 1 + 3
         setName(prof?.name ?? "");
         setEmail(prof?.email ?? authUser.email ?? "");
         setMobile(prof?.phone ?? "");
@@ -502,32 +529,30 @@ export default function BecomeAMentor() {
           return;
         }
 
-        // ✅ Ensure a profile row exists BEFORE any mentors write (avoids FK error)
-        await ensureProfileExists(profileId, userId, {
+        // Reuse/create profile row and get the real profileId for this user_id
+        const resolvedId = await ensureProfile(userId, profileId, {
           name: name.trim(),
           email: email.trim(),
           phone: mobile.trim(),
         });
+        setProfileId(resolvedId);
 
-        // Persist basic info (your existing helper)
+        // Persist basic info
         await saveBasicInfo({
-          profileId,
+          profileId: resolvedId,
           email: email.trim(),
           phone: mobile.trim(),
           name: name.trim(),
         });
 
-        // Optional: persist bio/avatar if your schema has these columns
+        // Optional bio/avatar (ignore if columns don’t exist)
         try {
-          const { error: upErr } = await supabase
+          await supabase
             .from("profiles")
             .update({ bio: bio || null, avatar: photo || null })
-            .eq("id", profileId);
-          if (upErr) {
-            // ignore silently if your schema doesn't have these columns
-          }
+            .eq("id", resolvedId);
         } catch {
-          // ignore
+          /* noop */
         }
 
         setStep(2);
@@ -552,10 +577,10 @@ export default function BecomeAMentor() {
 
         await upsertMentorApplication({
           userId,
-          profileId,
-          resumePath,               // keep this name; your helper expects it
-          specialties: categories,  // stored to profiles.specialties
-          experience: safeYears,    // stored to profiles.experience
+          profileId,            // resolved id from Step 1
+          resumePath,
+          specialties: categories,
+          experience: safeYears,
         });
 
         setSubmitting(false);
@@ -777,3 +802,4 @@ export default function BecomeAMentor() {
     </>
   );
 }
+  

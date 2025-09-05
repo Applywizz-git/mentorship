@@ -801,7 +801,7 @@ const AdminDashboard = () => {
                 <DropdownMenuItem
                   onClick={() => {
                     logout();
-                    navigate("/login");
+                    navigate("/");
                   }}
                 >
                   <LogOut className="mr-2 h-4 w-4" />

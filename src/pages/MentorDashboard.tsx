@@ -468,24 +468,25 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Navbar } from "@/components/ui/navbar";
 import { Calendar, Clock, User, Settings } from "lucide-react";
+import MentorGate from "@/components/MentorGate";
+import AvailabilityCalendar from "@/components/AvailabilityCalendar";
 import {
   getCurrentMentorId,
   getMentor,
   listBookings,
   listSlotsForMentor,
-     // (kept)
   updateMentorProfile,
-  getMyMentorId,                 // (already imported)
-  listUpcomingForMentor,          // (already imported)
+  getMyMentorId,
+  listUpcomingForMentor,
   rescheduleBookingDb,
   confirmBookingDb,
-  setCurrentMentorId,               // ✅ NEW
-  declineBookingDb                // ✅ NEW
+  setCurrentMentorId,
+  declineBookingDb
 } from "@/lib/data";
+
 import type { Booking, TimeSlot, Mentor, SessionPackage, WeeklySlot } from "@/lib/types";
 import { useToast } from "@/hooks/use-toast";
-import AvailabilityCalendar from "@/components/AvailabilityCalendar";
-import MentorGate from "@/components/MentorGate"; // ✅ ADDED
+import { supabase } from "@/lib/supabase";
 
 const MentorDashboard = () => {
   const [mentor, setMentor] = useState<Mentor | null>(null);
@@ -515,112 +516,104 @@ const MentorDashboard = () => {
   const [pending, setPending] = useState(0);
   const [tx, setTx] = useState<{id:string; date:string; client:string; amount:number; status:"pending"|"paid"}[]>([]);
 
-  // ✅ DB-backed upcoming rows
+  // DB-backed upcoming rows
   const [upcoming, setUpcoming] = useState<any[]>([]);
-
-  // ✅ NEW: Pending requests for this mentor
   const [pendingBookings, setPendingBookings] = useState<Booking[]>([]);
   const [declineNote, setDeclineNote] = useState<string>("");
 
   const { toast } = useToast();
 
-  // ✅ Load upcoming (DB) and cache a valid mentorId if needed
+  // 🔒 Force home on SIGNED_OUT while you’re on /mentor
   useEffect(() => {
-  (async () => {
-    // try cached
-    let mentorId = getCurrentMentorId();
-
-    // resolve if missing
-    if (!mentorId) {
-      const resolved = await getMyMentorId();
-      if (!resolved) {
-        // not a mentor or no mentor row yet — do not query
-        return;
+    const { data: sub } = supabase.auth.onAuthStateChange((event) => {
+      if (event === "SIGNED_OUT") {
+        // hard redirect wins every race
+        window.location.assign("/");
       }
-      mentorId = resolved;
-      setCurrentMentorId(mentorId); // cache it for next time
-    }
-
-    // ✅ only now run queries that require a UUID
-    const [mentorData, mentorBookings, mentorSlots] = await Promise.all([
-      getMentor(mentorId),
-      listBookings({ mentorId }),
-      listSlotsForMentor(mentorId),
-    ]);
-
-    // ...set state...
-  })();
-}, []);
-
-  // Main load (mentor, all bookings, slots, pending requests, earnings init)
-  useEffect(() => {
-    (async () => {
-      // ✅ ensure we have a real mentor id even if cache was empty
-      let currentMentorId = getCurrentMentorId();
-      if (!currentMentorId || currentMentorId === "fallback") {
-        currentMentorId = (await getMyMentorId()) || "";
-      }
-      if (!currentMentorId) return;
-
-      const mentorData = await getMentor(currentMentorId);
-      if (!mentorData) return;
-
-      setMentor(mentorData);
-      setProfileData({
-        name: mentorData.name,
-        title: mentorData.title,
-        company: mentorData.company
-      });
-
-      const mentorBookings = await listBookings({ mentorId: currentMentorId });
-      setBookings(mentorBookings);
-
-      // ✅ load PENDING requests
-      const pend = await listBookings({ mentorId: currentMentorId, status: "pending" as any });
-      setPendingBookings(pend);
-
-      const mentorSlots = await listSlotsForMentor(currentMentorId);
-      setSlots(mentorSlots);
-
-      // initialize editors
-      setCurrency(mentorData.packages?.[0]?.currency ?? "USD");
-      setPackagesState(
-        mentorData.packages?.length
-          ? mentorData.packages
-          : [
-              { id: "pkg30-ui", label: "30 min", minutes: 30, price: mentorData.price, currency: (mentorData.packages?.[0]?.currency ?? "USD") as any, active: true },
-              { id: "pkg45-ui", label: "45 min", minutes: 45, price: Math.round(mentorData.price * 1.3), currency: (mentorData.packages?.[0]?.currency ?? "USD") as any, active: true },
-              { id: "pkg60-ui", label: "60 min", minutes: 60, price: Math.round(mentorData.price * 1.6), currency: (mentorData.packages?.[0]?.currency ?? "USD") as any, active: true },
-            ]
-      );
-      setWeeklyEdit(mentorData.weeklySchedule ?? []);
-      setBufferEdit(mentorData.bufferMinutes ?? 15);
-
-      // earnings (local calc)
-      const now = new Date();
-      const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-      const completedOrConfirmed = mentorBookings.filter(b => b.status !== "cancelled");
-      const mtdSum = completedOrConfirmed
-        .filter(b => new Date(b.startIso) >= startOfMonth && new Date(b.startIso) <= now)
-        .reduce((acc, b) => acc + (b.price || 0), 0);
-      const lifeSum = completedOrConfirmed.reduce((acc, b) => acc + (b.price || 0), 0);
-      const pendingSum = 0; // demo: payouts subsystem not implemented
-      const txRows = completedOrConfirmed.slice(-10).map(b => ({
-        id: b.id,
-        date: b.startIso,
-        client: b.clientId,
-        amount: b.price || 0,
-        status: "paid" as const
-      }));
-
-      setMtd(mtdSum);
-      setLifetime(lifeSum);
-      setPending(pendingSum);
-      setTx(txRows);
-    })();
+    });
+    return () => sub.subscription.unsubscribe();
   }, []);
 
-  // Helper to refresh after actions
+  // Single, fast loader (removes duplicated effects)
+  useEffect(() => {
+    let alive = true;
+
+    (async () => {
+      try {
+        // resolve mentorId (cached → DB)
+        let mid = getCurrentMentorId();
+        if (!mid || mid === "fallback") {
+          mid = (await getMyMentorId()) || "";
+          if (mid) setCurrentMentorId(mid);
+        }
+        if (!mid) return; // not a mentor, MentorGate will handle gating
+
+        // parallel fetch
+        const [mentorData, allBookings, pend, sl, upc] = await Promise.all([
+          getMentor(mid),
+          listBookings({ mentorId: mid }),
+          listBookings({ mentorId: mid, status: "pending" as any }),
+          listSlotsForMentor(mid),
+          listUpcomingForMentor(mid),
+        ]);
+
+        if (!alive) return;
+
+        if (mentorData) {
+          setMentor(mentorData);
+          setProfileData({
+            name: mentorData.name,
+            title: mentorData.title,
+            company: mentorData.company
+          });
+          setCurrency(mentorData.packages?.[0]?.currency ?? "USD");
+          setPackagesState(
+            mentorData.packages?.length
+              ? mentorData.packages
+              : [
+                  { id: "pkg30-ui", label: "30 min", minutes: 30, price: mentorData.price, currency: (mentorData.packages?.[0]?.currency ?? "USD") as any, active: true },
+                  { id: "pkg45-ui", label: "45 min", minutes: 45, price: Math.round(mentorData.price * 1.3), currency: (mentorData.packages?.[0]?.currency ?? "USD") as any, active: true },
+                  { id: "pkg60-ui", label: "60 min", minutes: 60, price: Math.round(mentorData.price * 1.6), currency: (mentorData.packages?.[0]?.currency ?? "USD") as any, active: true },
+                ]
+          );
+          setWeeklyEdit(mentorData.weeklySchedule ?? []);
+          setBufferEdit(mentorData.bufferMinutes ?? 15);
+        }
+
+        setBookings(allBookings);
+        setPendingBookings(pend);
+        setSlots(sl);
+        setUpcoming(upc);
+
+        // earnings (local calc)
+        const now = new Date();
+        const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+        const completedOrConfirmed = allBookings.filter(b => b.status !== "cancelled");
+        const mtdSum = completedOrConfirmed
+          .filter(b => new Date(b.startIso) >= startOfMonth && new Date(b.startIso) <= now)
+          .reduce((acc, b) => acc + (b.price || 0), 0);
+        const lifeSum = completedOrConfirmed.reduce((acc, b) => acc + (b.price || 0), 0);
+        const pendingSum = 0; // payouts not modeled here
+        const txRows = completedOrConfirmed.slice(-10).map(b => ({
+          id: b.id,
+          date: b.startIso,
+          client: b.clientId,
+          amount: b.price || 0,
+          status: "paid" as const
+        }));
+
+        setMtd(mtdSum);
+        setLifetime(lifeSum);
+        setPending(pendingSum);
+        setTx(txRows);
+      } catch (e: any) {
+        toast({ title: "Load failed", description: e?.message ?? "Please retry.", variant: "destructive" });
+      }
+    })();
+
+    return () => { alive = false; };
+  }, [toast]);
+
   const refreshAll = async (mid: string) => {
     const [allB, pendB, sl, upc] = await Promise.all([
       listBookings({ mentorId: mid }),
@@ -637,16 +630,8 @@ const MentorDashboard = () => {
   const formatDateTime = (isoString: string) => {
     const date = new Date(isoString);
     return {
-      date: date.toLocaleDateString('en-US', {
-        weekday: 'short',
-        month: 'short',
-        day: 'numeric'
-      }),
-      time: date.toLocaleTimeString('en-US', {
-        hour: 'numeric',
-        minute: '2-digit',
-        hour12: true
-      })
+      date: date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
+      time: date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })
     };
   };
 
@@ -669,18 +654,14 @@ const MentorDashboard = () => {
 
     try {
       await rescheduleBookingDb(selectedBooking.id, newSlotId, reason);
-      const { toast } = await import("@/hooks/use-toast");
       toast({ title: "Session rescheduled!", description: "The mentee has been notified of the change." });
 
-      if (mentor) {
-        await refreshAll(mentor.id); // ✅ also refresh upcoming & pending
-      }
+      if (mentor) await refreshAll(mentor.id);
 
       setSelectedBooking(null);
       setNewSlotId("");
       setRescheduleReason("");
     } catch (e: any) {
-      const { toast } = await import("@/hooks/use-toast");
       toast({ title: "Reschedule failed", description: e?.message ?? "Please try another slot.", variant: "destructive" });
     }
   };
@@ -689,12 +670,10 @@ const MentorDashboard = () => {
     if (!mentor) return;
     updateMentorProfile(mentor.id, profileData);
     setMentor({ ...mentor, ...profileData });
-    const { toast } = require("@/hooks/use-toast");
     toast({ title: "Profile updated!", description: "Your profile information has been saved." });
     setEditProfileOpen(false);
   };
 
-  // Pricing handlers (minutes instead of duration)
   const togglePackageActive = (minutes: 30|45|60, active: boolean) => {
     setPackagesState(prev => prev.map(p => p.minutes === minutes ? { ...p, active } : p));
   };
@@ -711,11 +690,9 @@ const MentorDashboard = () => {
     }));
     updateMentorProfile(mentor.id, { packages: normalized });
     setMentor({ ...mentor, packages: normalized });
-    const { toast } = require("@/hooks/use-toast");
     toast({ title: "Pricing updated", description: "Your session packages were saved." });
   };
 
-  // Availability handlers (weekday/active instead of day/enabled)
   const toggleDay = (weekday: number, active: boolean) => {
     setWeeklyEdit(prev => prev.map(s => s.weekday === weekday ? { ...s, active } : s));
   };
@@ -726,33 +703,17 @@ const MentorDashboard = () => {
     if (!mentor) return;
     updateMentorProfile(mentor.id, { weeklySchedule: weeklyEdit, bufferMinutes: bufferEdit });
     setMentor({ ...mentor, weeklySchedule: weeklyEdit, bufferMinutes: bufferEdit });
-    const { toast } = require("@/hooks/use-toast");
     toast({ title: "Availability updated", description: "Your weekly schedule was saved." });
   };
 
-  // ✅ Prefer DB-backed upcoming; if empty, fall back to legacy local computation
-  //    Also ensure ONLY CONFIRMED appear in upcoming
+  // Upcoming list preferring DB-backed rows; fallback to legacy local
   const legacyUpcoming = bookings.filter(b => {
-  const slot = getBookingSlot(b.slotId);
-  return b.status === "confirmed" && slot && new Date(slot.startIso) > new Date();
-});
-
-const upcomingBookings = (upcoming && upcoming.length > 0)
-  ? upcoming.filter((b: any) => b.status === "confirmed" && new Date(b.startIso) > new Date())
-  : legacyUpcoming;
-
-  if (!mentor) {
-    return (
-      <div className="min-h-screen bg-background">
-        <Navbar />
-        <div className="px-6 py-8">
-          <div className="max-w-4xl mx-auto text-center">
-            <h1 className="text-2xl font-bold text-foreground mb-4">Please log in to access your dashboard</h1>
-          </div>
-        </div>
-      </div>
-    );
-  }
+    const slot = getBookingSlot(b.slotId);
+    return b.status === "confirmed" && slot && new Date(slot.startIso) > new Date();
+  });
+  const upcomingBookings = (upcoming && upcoming.length > 0)
+    ? upcoming.filter((b: any) => b.status === "confirmed" && new Date(b.startIso) > new Date())
+    : legacyUpcoming;
 
   return (
     <MentorGate>
@@ -761,38 +722,27 @@ const upcomingBookings = (upcoming && upcoming.length > 0)
 
         <div className="px-6 py-8">
           <div className="max-w-6xl mx-auto">
+
             {/* Header */}
             <div className="flex items-center justify-between mb-8">
               <div>
-                <h1 className="text-3xl font-bold text-foreground mb-2">Welcome back, {mentor.name}</h1>
-                <p className="text-muted-foreground">{mentor.title} at {mentor.company}</p>
+                <h1 className="text-3xl font-bold text-foreground mb-2">
+                  {mentor ? `Welcome back, ${mentor.name}` : "Loading your dashboard…"}
+                </h1>
+                {mentor && <p className="text-muted-foreground">{mentor.title} at {mentor.company}</p>}
               </div>
-              <div className="flex items-center gap-2">
-                {(mentor.status === 'pending' || mentor.status === 'pending_approval') ? (
-                  <Badge className="bg-yellow-100 text-yellow-800 border border-yellow-300">⏳ Pending Approval</Badge>
-                ) : mentor.verified ? (
-                  <Badge className="bg-verified-green text-white">✓ Verified</Badge>
-                ) : null}
-                <Badge variant="secondary">{mentor.rating} rating</Badge>
-              </div>
+              {mentor && (
+                <div className="flex items-center gap-2">
+                  {(mentor.status === 'pending' || mentor.status === 'pending_approval') ? (
+                    <Badge className="bg-yellow-100 text-yellow-800 border border-yellow-300">⏳ Pending Approval</Badge>
+                  ) : mentor.verified ? (
+                    <Badge className="bg-verified-green text-white">✓ Verified</Badge>
+                  ) : null}
+                  <Badge variant="secondary">{mentor.rating} rating</Badge>
+                </div>
+              )}
             </div>
 
-            {/* Pending banner */}
-            {(mentor.status === 'pending' || mentor.status === 'pending_approval') && (
-              <div className="mb-6 rounded-lg border border-yellow-300 bg-yellow-50 text-yellow-800 p-3 text-sm">
-                Your profile is <b>Pending Approval</b>. You can still update availability & pricing,
-                but you won’t appear in search until approved.
-                <Button
-                  variant="link"
-                  className="ml-2 p-0 align-baseline"
-                  onClick={() => (window.location.href = "/become-mentor")}
-                >
-                  Edit onboarding
-                </Button>
-              </div>
-            )}
-
-            {/* Dashboard Tabs */}
             <Tabs defaultValue="upcoming" className="space-y-6">
               <TabsList className="grid w-full grid-cols-7">
                 <TabsTrigger value="requests">Requests</TabsTrigger>
@@ -804,7 +754,7 @@ const upcomingBookings = (upcoming && upcoming.length > 0)
                 <TabsTrigger value="earnings">Earnings</TabsTrigger>
               </TabsList>
 
-              {/* ✅ Requests tab now shows real pending items with Confirm/Decline */}
+              {/* Requests */}
               <TabsContent value="requests">
                 <Card>
                   <CardHeader>
@@ -837,7 +787,7 @@ const upcomingBookings = (upcoming && upcoming.length > 0)
                                     try {
                                       await confirmBookingDb(b.id);
                                       toast({ title: "Booking confirmed" });
-                                      await refreshAll(mentor.id);
+                                      if (mentor) await refreshAll(mentor.id);
                                     } catch (e: any) {
                                       toast({ title: "Confirm failed", description: e?.message ?? "Try again.", variant: "destructive" });
                                     }
@@ -868,7 +818,7 @@ const upcomingBookings = (upcoming && upcoming.length > 0)
                                               await declineBookingDb(b.id, declineNote.trim() || undefined);
                                               setDeclineNote("");
                                               toast({ title: "Booking declined" });
-                                              await refreshAll(mentor.id); // slot freed & lists updated
+                                              if (mentor) await refreshAll(mentor.id);
                                             } catch (e: any) {
                                               toast({ title: "Decline failed", description: e?.message ?? "Try again.", variant: "destructive" });
                                             }
@@ -890,12 +840,12 @@ const upcomingBookings = (upcoming && upcoming.length > 0)
                 </Card>
               </TabsContent>
 
+              {/* Upcoming */}
               <TabsContent value="upcoming">
                 <Card>
                   <CardHeader>
                     <CardTitle className="flex items-center gap-2">
                       <Calendar className="w-5 h-5" />
-                      {/* ✅ counts CONFIRMED only */}
                       Upcoming Sessions ({upcomingBookings.length})
                     </CardTitle>
                   </CardHeader>
@@ -908,7 +858,6 @@ const upcomingBookings = (upcoming && upcoming.length > 0)
                     ) : (
                       <div className="space-y-4">
                         {upcomingBookings.map((booking: any) => {
-                          // Prefer startIso from DB-backed 'upcoming'; else fall back to local slot lookup
                           const startIso: string =
                             booking.startIso ||
                             getBookingSlot(booking.slotId)?.startIso ||
@@ -924,7 +873,6 @@ const upcomingBookings = (upcoming && upcoming.length > 0)
                                   <User className="w-5 h-5 text-primary" />
                                 </div>
                                 <div>
-                                  {/* demo data stores only clientId; show it */}
                                   <h4 className="font-medium">{booking.clientId}</h4>
                                   <div className="flex items-center gap-4 mt-1 text-sm text-muted-foreground">
                                     <span className="flex items-center gap-1">
@@ -1018,6 +966,7 @@ const upcomingBookings = (upcoming && upcoming.length > 0)
                 </Card>
               </TabsContent>
 
+              {/* Past */}
               <TabsContent value="past">
                 <Card>
                   <CardHeader>
@@ -1060,6 +1009,7 @@ const upcomingBookings = (upcoming && upcoming.length > 0)
                 </Card>
               </TabsContent>
 
+              {/* Profile */}
               <TabsContent value="profile">
                 <Card>
                   <CardHeader>
@@ -1069,89 +1019,94 @@ const upcomingBookings = (upcoming && upcoming.length > 0)
                     </CardTitle>
                   </CardHeader>
                   <CardContent className="space-y-6">
-                    <div className="flex items-center gap-4">
-                      <img
-                        src={mentor.avatar}
-                        alt={mentor.name}
-                        className="w-20 h-20 rounded-full object-cover"
-                      />
-                      <div>
-                        <h3 className="text-lg font-semibold">{mentor.name}</h3>
-                        <p className="text-muted-foreground">{mentor.title}</p>
-                        {(mentor.status === 'pending' || mentor.status === 'pending_approval')
-                          ? <Badge className="mt-1 bg-yellow-100 text-yellow-800 border border-yellow-300">⏳ Pending Approval</Badge>
-                          : <Badge className="mt-1 bg-verified-green text-white">✓ Verified</Badge>
-                        }
-                      </div>
-                    </div>
-
-                    <div className="grid md:grid-cols-2 gap-6">
-                      <div>
-                        <h4 className="font-medium mb-2">Profile Information</h4>
-                        <div className="space-y-2 text-sm">
-                          <p><span className="font-medium">Name:</span> {mentor.name}</p>
-                          <p><span className="font-medium">Title:</span> {mentor.title}</p>
-                          <p><span className="font-medium">Company:</span> {mentor.company}</p>
-                          <p><span className="font-medium">Experience:</span> {mentor.experience} years</p>
-                          <p><span className="font-medium">Rating:</span> {mentor.rating}/5.0 ({mentor.reviews} reviews)</p>
-                        </div>
-                      </div>
-
-                      <div>
-                        <h4 className="font-medium mb-2">Specialties</h4>
-                        <div className="flex flex-wrap gap-2">
-                          {mentor.specialties.map((specialty) => (
-                            <Badge key={specialty} variant="secondary">
-                              {specialty}
-                            </Badge>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-
-                    <Dialog open={editProfileOpen} onOpenChange={setEditProfileOpen}>
-                      <DialogTrigger asChild>
-                        <Button>Edit Profile Details</Button>
-                      </DialogTrigger>
-                      <DialogContent>
-                        <DialogHeader>
-                          <DialogTitle>Edit Profile</DialogTitle>
-                        </DialogHeader>
-                        <div className="space-y-4">
+                    {mentor && (
+                      <>
+                        <div className="flex items-center gap-4">
+                          <img
+                            src={mentor.avatar}
+                            alt={mentor.name}
+                            className="w-20 h-20 rounded-full object-cover"
+                          />
                           <div>
-                            <Label htmlFor="name">Name</Label>
-                            <Input
-                              id="name"
-                              value={profileData.name}
-                              onChange={(e) => setProfileData({ ...profileData, name: e.target.value })}
-                            />
+                            <h3 className="text-lg font-semibold">{mentor.name}</h3>
+                            <p className="text-muted-foreground">{mentor.title}</p>
+                            {(mentor.status === 'pending' || mentor.status === 'pending_approval')
+                              ? <Badge className="mt-1 bg-yellow-100 text-yellow-800 border border-yellow-300">⏳ Pending Approval</Badge>
+                              : <Badge className="mt-1 bg-verified-green text-white">✓ Verified</Badge>
+                            }
                           </div>
-                          <div>
-                            <Label htmlFor="title">Title</Label>
-                            <Input
-                              id="title"
-                              value={profileData.title}
-                              onChange={(e) => setProfileData({ ...profileData, title: e.target.value })}
-                            />
-                          </div>
-                          <div>
-                            <Label htmlFor="company">Company</Label>
-                            <Input
-                              id="company"
-                              value={profileData.company}
-                              onChange={(e) => setProfileData({ ...profileData, company: e.target.value })}
-                            />
-                          </div>
-                          <Button onClick={handleSaveProfile} className="w-full">
-                            Save Changes
-                          </Button>
                         </div>
-                      </DialogContent>
-                    </Dialog>
+
+                        <div className="grid md:grid-cols-2 gap-6">
+                          <div>
+                            <h4 className="font-medium mb-2">Profile Information</h4>
+                            <div className="space-y-2 text-sm">
+                              <p><span className="font-medium">Name:</span> {mentor.name}</p>
+                              <p><span className="font-medium">Title:</span> {mentor.title}</p>
+                              <p><span className="font-medium">Company:</span> {mentor.company}</p>
+                              <p><span className="font-medium">Experience:</span> {mentor.experience} years</p>
+                              <p><span className="font-medium">Rating:</span> {mentor.rating}/5.0 ({mentor.reviews} reviews)</p>
+                            </div>
+                          </div>
+
+                          <div>
+                            <h4 className="font-medium mb-2">Specialties</h4>
+                            <div className="flex flex-wrap gap-2">
+                              {mentor.specialties.map((specialty) => (
+                                <Badge key={specialty} variant="secondary">
+                                  {specialty}
+                                </Badge>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+
+                        <Dialog open={editProfileOpen} onOpenChange={setEditProfileOpen}>
+                          <DialogTrigger asChild>
+                            <Button>Edit Profile Details</Button>
+                          </DialogTrigger>
+                          <DialogContent>
+                            <DialogHeader>
+                              <DialogTitle>Edit Profile</DialogTitle>
+                            </DialogHeader>
+                            <div className="space-y-4">
+                              <div>
+                                <Label htmlFor="name">Name</Label>
+                                <Input
+                                  id="name"
+                                  value={profileData.name}
+                                  onChange={(e) => setProfileData({ ...profileData, name: e.target.value })}
+                                />
+                              </div>
+                              <div>
+                                <Label htmlFor="title">Title</Label>
+                                <Input
+                                  id="title"
+                                  value={profileData.title}
+                                  onChange={(e) => setProfileData({ ...profileData, title: e.target.value })}
+                                />
+                              </div>
+                              <div>
+                                <Label htmlFor="company">Company</Label>
+                                <Input
+                                  id="company"
+                                  value={profileData.company}
+                                  onChange={(e) => setProfileData({ ...profileData, company: e.target.value })}
+                                />
+                              </div>
+                              <Button onClick={handleSaveProfile} className="w-full">
+                                Save Changes
+                              </Button>
+                            </div>
+                          </DialogContent>
+                        </Dialog>
+                      </>
+                    )}
                   </CardContent>
                 </Card>
               </TabsContent>
 
+              {/* Availability */}
               <TabsContent value="availability" className="p-4">
                 <h2 className="text-xl font-semibold mb-4">Availability Management</h2>
                 {getCurrentMentorId() ? (
@@ -1161,6 +1116,7 @@ const upcomingBookings = (upcoming && upcoming.length > 0)
                 )}
               </TabsContent>
 
+              {/* Pricing */}
               <TabsContent value="pricing">
                 <Card>
                   <CardHeader>
@@ -1206,6 +1162,7 @@ const upcomingBookings = (upcoming && upcoming.length > 0)
                 </Card>
               </TabsContent>
 
+              {/* Earnings */}
               <TabsContent value="earnings">
                 <Card>
                   <CardHeader>

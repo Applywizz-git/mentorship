@@ -965,7 +965,7 @@ import { supabase } from "@/lib/supabase";
 const LS = (() => {
   try { return window?.localStorage ?? null } catch { return null }
 })();
-
+const MENTOR_ID_CACHE_KEY = "currentMentorId";
 const KEY = {
   users: 'mc.users',
   mentors: 'mc.mentors',
@@ -1281,47 +1281,45 @@ export async function upsertMentorApplication({
   userId: string;
   profileId: string;
   resumePath: string | null;
-  specialties?: string[] | string | null;
-  experience?: number | null;
+  specialties?: string[];
+  experience?: number;
 }) {
-  // ensure a mentor row exists
+  if (!userId) throw new Error("Missing userId");
+  if (!profileId) throw new Error("Missing profileId");
+
+  // 1) keep profile in sync
+  const profileUpdate: any = {};
+  if (Array.isArray(specialties)) profileUpdate.specialties = specialties.length ? specialties : null;
+  if (typeof experience === "number") profileUpdate.experience = experience;
+
+  if (Object.keys(profileUpdate).length > 0) {
+    const { error: pErr } = await supabase.from("profiles").update(profileUpdate).eq("id", profileId);
+    if (pErr) throw pErr;
+  }
+
+  // 2) find an existing mentors row by user_id OR profile_id
   const { data: existing, error: selErr } = await supabase
     .from("mentors")
-    .select("id")
-    .eq("user_id", userId)
+    .select("id, user_id, profile_id")
+    .or(`user_id.eq.${userId},profile_id.eq.${profileId}`)
     .maybeSingle();
   if (selErr) throw selErr;
 
-  // update profile with expertise (no pricing)
-  if (specialties !== undefined || experience !== undefined) {
-    const { error: profErr } = await supabase
-      .from("profiles")
-      .update({
-        specialties: Array.isArray(specialties) ? specialties : specialties ?? null,
-        experience: experience ?? null,
-      })
-      .eq("id", profileId);
-    if (profErr) throw profErr;
-  }
-
-  const payload: any = {
-    user_id: userId,
-    profile_id: profileId,
-    resume_url: resumePath,
-    application_status: 'pending' as ApplicationStatus,
+  const payload = {
+    user_id: userId,                 // ✅ never null
+    profile_id: profileId,           // ✅ never null
+    resume_url: resumePath ?? null,
+    application_status: "pending" as const,
   };
 
   if (existing?.id) {
-    const { error } = await supabase.from("mentors").update(payload).eq("id", existing.id);
-    if (error) throw error;
-    return existing.id;
+    const { error: upErr } = await supabase.from("mentors").update(payload).eq("id", existing.id);
+    if (upErr) throw upErr;
   } else {
-    const { data: ins, error } = await supabase.from("mentors").insert(payload).select("id").single();
-    if (error) throw error;
-    return ins.id as string;
+    const { error: insErr } = await supabase.from("mentors").insert(payload);
+    if (insErr) throw insErr;
   }
 }
-
 /* =========================================================
    2) MENTORS — Supabase reads (kept same function names)
    ========================================================= */
@@ -1533,7 +1531,22 @@ export function updateMentorProfile(id: string, patch: Partial<Mentor>) {
   }
   return updated;
 }
+export function clearCurrentMentorId() {
+  try { localStorage.removeItem(MENTOR_ID_CACHE_KEY); } catch {}
+}
 
+// If you cache the current user/role anywhere, clear it here.
+// Adjust keys to whatever you actually use.
+export function clearUserCache() {
+  const keys = [
+    "aw.currentUser",
+    "currentUser",
+    "user",
+    "aw.user",
+  ];
+  try { keys.forEach(k => localStorage.removeItem(k)); } catch {}
+  try { keys.forEach(k => sessionStorage.removeItem(k)); } catch {}
+}
 /* =========================================================
    3) SLOTS — Supabase reads
    ========================================================= */
@@ -1553,6 +1566,7 @@ export async function listSlotsForMentor(mentorId: string): Promise<TimeSlot[]> 
     available: s.available,
   }));
 }
+
 
 /* =========================================================
    4) BOOKINGS — Supabase list + atomic RPC booking
@@ -2199,43 +2213,36 @@ function normalizeWeekly(weekly: any[]): WeeklySlot[] {
  *   { claimed: false } if nothing to claim.
  */
 export async function claimApprovedMentorForCurrentUser() {
-  // 1) Auth + email
   const { data: auth } = await supabase.auth.getUser();
-  const user = auth?.user;
-  if (!user?.id) return { claimed: false };
+  const uid = auth?.user?.id;
+  if (!uid) return;
 
-  const uid = user.id;
-  const email = user.email ?? null;
-  if (!email) return { claimed: false };
-
-  // 2) Link any approved applicant row that matches this email (user_id/profile_id were null)
-  const { data: updatedRows, error: updErr } = await supabase
-    .from("mentors")
-    .update({ user_id: uid, profile_id: uid })
-    .eq("application_status", "approved")
-    .is("user_id", null)
-    .eq("applicant_email", email)
-    .select("id"); // returns updated rows if any
-
-  if (updErr) throw updErr;
-
-  // 3) Regardless of whether the row was already linked or just linked now,
-  //    set profile verified=true (policy allows when an approved row matches).
-  const { error: profErr } = await supabase
+  const { data: prof } = await supabase
     .from("profiles")
-    .update({ verified: true, role: "mentor", email }) // keep role tidy
-    .eq("id", uid);
+    .select("id, email")
+    .eq("user_id", uid)
+    .maybeSingle();
+  if (!prof) return;
 
-  // If the update failed because the profile row doesn't exist in your schema,
-  // you can ignore or pre-create it elsewhere in your signup flow.
-  if (profErr && profErr.code !== "PGRST116") {
-    // ignore row-not-found; rethrow real errors
-    throw profErr;
+  // find an approved row for this person (by user_id, profile_id, or email)
+  const { data: row, error } = await supabase
+    .from("mentors")
+    .select("id, user_id, profile_id, application_status")
+    .or(`user_id.eq.${uid},profile_id.eq.${prof.id},applicant_email.eq.${prof.email}`)
+    .eq("application_status", "approved")
+    .maybeSingle();
+  if (error || !row) return;
+
+  // attach it if needed
+  if (row.user_id !== uid || row.profile_id !== prof.id) {
+    await supabase.from("mentors").update({
+      user_id: uid,
+      profile_id: prof.id
+    }).eq("id", row.id);
   }
 
-  const claimed = (updatedRows?.length ?? 0) > 0;
-  return { claimed };
+  // ensure verified
+  await supabase.from("profiles").update({ verified: true, role: "mentor" }).eq("id", prof.id);
 }
-
 
 
